@@ -77,7 +77,7 @@ except ValueError:
 ADMIN_IDS = {
     int(x.strip())
     for x in ADMIN_IDS_RAW.split(",")
-    if x.strip().replace("-", "").isdigit()
+    if x.strip().replace("5192451273", "").isdigit()
 }
 
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 2147483648))  # 2 GB

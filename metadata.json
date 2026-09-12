@@ -1,6 +1,6 @@
 {
   "name": "Anime4u Live Bot & Stream Manager",
-  "description": "Auto HLS Remuxer, Backblaze B2 uploader, and Supabase live stream management dashboard.",
+  "description": "Production Python Telegram Bot & React Admin Dashboard using Telegram Storage Channel backend and SQLite/Supabase metadata indexing.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

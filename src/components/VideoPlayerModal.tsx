@@ -54,7 +54,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({ stream, onCl
             <div>
               <h3 className="font-bold text-white text-lg leading-tight">{stream.title}</h3>
               <p className="text-xs text-slate-400 font-mono">
-                {stream.folder_path ? `${stream.folder_path}/` : 'B2 Storage'}
+                {stream.folder_path ? `${stream.folder_path}/` : 'Telegram Channel Storage'}
               </p>
             </div>
           </div>

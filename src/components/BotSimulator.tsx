@@ -198,7 +198,7 @@ export const BotSimulator: React.FC<BotSimulatorProps> = ({
             <Bot className="w-4 h-4" />
             <span>Interactive Telegram Bot Console</span>
           </div>
-          <h2 className="text-2xl font-bold text-white">Bot Command Simulator (@Anime4uB2Bot)</h2>
+          <h2 className="text-2xl font-bold text-white">Bot Command Simulator (@Anime4uStorageBot)</h2>
           <p className="text-xs text-slate-400 mt-1">
             Tests python-telegram-bot command handlers, inline keyboards, duplicate modals, and channel posting.
           </p>

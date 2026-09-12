@@ -72,9 +72,96 @@ def init_db():
         )
     """)
 
+    # Audit Logs table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_admin ON audit_logs(admin_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at)")
+
     conn.commit()
     conn.close()
     logger.info("SQLite database schema initialized successfully")
+
+def log_audit(admin_id: int, action: str, details: str):
+    """Log admin actions for security audit trail."""
+    try:
+        conn = get_sqlite_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO audit_logs (admin_id, action, details, created_at) VALUES (?, ?, ?, ?)",
+            (admin_id, action, details, datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to log audit event: {e}")
+
+def get_recent_audit_logs(limit: int = 15) -> List[Dict[str, Any]]:
+    conn = get_sqlite_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_stats() -> Dict[str, Any]:
+    """Calculates real storage metrics directly from database records."""
+    conn = get_sqlite_conn()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*), COALESCE(SUM(file_size), 0) FROM file_records")
+    total_files, total_bytes = cursor.fetchone()
+
+    cursor.execute("SELECT COUNT(DISTINCT folder) FROM file_records")
+    total_folders = cursor.fetchone()[0]
+
+    cursor.execute("SELECT media_type, COUNT(*) FROM file_records GROUP BY media_type")
+    media_counts = dict(cursor.fetchall())
+
+    cursor.execute("SELECT COUNT(*) FROM hls_assets")
+    hls_count = cursor.fetchone()[0]
+
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    cursor.execute("SELECT COUNT(*) FROM file_records WHERE created_at LIKE ?", (f"{today_str}%",))
+    uploads_today = cursor.fetchone()[0]
+
+    conn.close()
+
+    return {
+        "total_files": total_files,
+        "total_folders": total_folders,
+        "total_bytes": total_bytes,
+        "readable_bytes": f"{total_bytes / (1024 * 1024):.1f} MB" if total_bytes < 1073741824 else f"{total_bytes / (1024 * 1024 * 1024):.2f} GB",
+        "videos": media_counts.get("video", 0),
+        "documents": media_counts.get("document", 0),
+        "audio": media_counts.get("audio", 0),
+        "photos": media_counts.get("photo", 0),
+        "hls_assets": hls_count,
+        "uploads_today": uploads_today,
+    }
+
+def get_recent_uploads(limit: int = 10) -> List[Dict[str, Any]]:
+    conn = get_sqlite_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM file_records ORDER BY created_at DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def list_all_message_ids() -> List[int]:
+    conn = get_sqlite_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT storage_message_id FROM file_records")
+    rows = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
 
 def find_by_unique_id(file_unique_id: str) -> Optional[Dict[str, Any]]:
     if supabase:

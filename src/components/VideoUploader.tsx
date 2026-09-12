@@ -54,6 +54,7 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
 
     const fileUniqueId = `AQAD_${Math.random().toString(36).substring(2, 12)}`;
     const title = customTitle.trim() || file.name.replace(/\.[^/.]+$/, '');
+    const mode = config.storageMode || 'telegram';
 
     // Duplicate Detection Check
     const existing = streams.find((s) => s.file_name === file.name || s.file_unique_id === fileUniqueId);
@@ -63,6 +64,7 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
       fileName: file.name,
       fileSize: file.size,
       folderPath: selectedFolder,
+      storageMode: mode,
       status: 'downloading',
       progress: 20,
       fileUniqueId,
@@ -80,20 +82,21 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
         prev
           ? {
               ...prev,
-              status: 'storing_telegram',
+              status: mode === 'b2' ? 'storing_b2' : 'storing_telegram',
               progress: 55,
               log:
                 prev.log +
-                `\n[00:00:03] 📦 Preparing Telegram message payload for Storage Channel (${config.storageChannelId})...` +
-                `\n[00:00:04] ⚡ Executing Telegram-to-Telegram native message copy (Zero VPS disk overhead)...`,
+                `\n[00:00:03] 📦 Preparing storage pipeline (Mode: ${mode.toUpperCase()})...` +
+                `\n[00:00:04] ⚡ Uploading to storage backend targets...`,
             }
           : null
       );
 
-      // Step 2: Storing in Private Telegram Channel
+      // Step 2: Storing in configured backends
       setTimeout(() => {
         const storageMessageId = Math.floor(Math.random() * 9000) + 1000;
         const channelId = parseInt(config.storageChannelId, 10) || -1001234567890;
+        const b2Path = `${selectedFolder}/${file.name}`;
 
         setActiveJob((prev) =>
           prev
@@ -101,11 +104,12 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
                 ...prev,
                 status: 'saving_metadata',
                 progress: 85,
-                storageMessageId,
-                storageChannelId: channelId,
+                storageMessageId: mode !== 'b2' ? storageMessageId : undefined,
+                storageChannelId: mode !== 'b2' ? channelId : undefined,
+                b2Path: mode !== 'telegram' ? b2Path : undefined,
                 log:
                   prev.log +
-                  `\n[00:00:06] ☁️ Posted to Storage Channel: message_id=${storageMessageId}` +
+                  `\n[00:00:06] ☁️ Upload verified in target storage backends!` +
                   `\n[00:00:07] 🗄️ Saving metadata record to Database (Folder: "${selectedFolder}")...`,
               }
             : null
@@ -113,8 +117,6 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
 
         // Step 3: Complete & Save Metadata
         setTimeout(() => {
-          const videoUrl = `https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4`;
-
           setActiveJob((prev) =>
             prev
               ? {
@@ -133,9 +135,14 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
           const newStream: StreamItem = {
             id: Math.random().toString(36).substring(2, 15),
             title,
-            video_url: videoUrl,
-            storage_message_id: storageMessageId,
-            storage_channel_id: channelId,
+            video_url: '',
+            storage_message_id: mode !== 'b2' ? storageMessageId : undefined,
+            storage_channel_id: mode !== 'b2' ? channelId : undefined,
+            b2_path: mode !== 'telegram' ? b2Path : undefined,
+            storage_mode: mode,
+            b2_status: mode !== 'telegram' ? 'success' : 'none',
+            telegram_status: mode !== 'b2' ? 'success' : 'none',
+            status: 'complete',
             file_unique_id: fileUniqueId,
             file_name: file.name,
             is_live: true,
@@ -174,12 +181,11 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
           <div>
             <div className="flex items-center space-x-2 text-indigo-400 text-xs font-semibold uppercase tracking-wider mb-1">
               <Send className="w-4 h-4" />
-              <span>Telegram Channel Storage Backend</span>
+              <span>Multi-Backend Storage Architecture</span>
             </div>
-            <h2 className="text-2xl font-bold text-white">Direct Channel Storage Upload</h2>
+            <h2 className="text-2xl font-bold text-white">Storage Upload Engine</h2>
             <p className="text-sm text-slate-400 mt-1 max-w-2xl">
-              Upload files directly into private Telegram Storage Channel (<code className="text-indigo-300">{config.storageChannelId}</code>).
-              Supports videos, audio, documents, and media with zero VPS disk copy overhead!
+              Supports Backblaze B2, Telegram Private Storage Channel (<code className="text-indigo-300">{config.storageChannelId}</code>), or Both dual storage mode!
             </p>
           </div>
 
@@ -268,10 +274,10 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
           <div>
             <h3 className="text-sm font-bold text-white flex items-center space-x-2">
               <Cpu className="w-4 h-4 text-indigo-400" />
-              <span>Telegram Storage Pipeline</span>
+              <span>Multi-Backend Pipeline</span>
             </h3>
             <p className="text-xs text-slate-400 mt-1">
-              Minimum disk usage Telegram-to-Telegram architecture:
+              Architecture overview across B2 and Telegram Storage:
             </p>
 
             <ul className="mt-4 space-y-3 text-xs text-slate-300">
@@ -281,7 +287,7 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
                 </div>
                 <div>
                   <span className="font-semibold text-white">Duplicate Detection</span>
-                  <p className="text-[11px] text-slate-400">Checks `file_unique_id` in database prior to storage.</p>
+                  <p className="text-[11px] text-slate-400">Checks `file_unique_id` & `b2_path` prior to storage.</p>
                 </div>
               </li>
               <li className="flex items-start space-x-2.5">
@@ -289,8 +295,8 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
                   <span className="font-mono font-bold text-[10px]">2</span>
                 </div>
                 <div>
-                  <span className="font-semibold text-white">Direct Channel Copy</span>
-                  <p className="text-[11px] text-slate-400">Uses Telegram native copy (`copy_message`) to avoid disk transfers.</p>
+                  <span className="font-semibold text-white">Multi-Storage Routing</span>
+                  <p className="text-[11px] text-slate-400">Routes payload to Backblaze B2, Telegram Channel, or Both.</p>
                 </div>
               </li>
               <li className="flex items-start space-x-2.5">
@@ -298,8 +304,8 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
                   <span className="font-mono font-bold text-[10px]">3</span>
                 </div>
                 <div>
-                  <span className="font-semibold text-white">Database Indexing</span>
-                  <p className="text-[11px] text-slate-400">Stores `storage_message_id`, filename, size, and virtual folder path.</p>
+                  <span className="font-semibold text-white">Database Metadata</span>
+                  <p className="text-[11px] text-slate-400">Indexes B2 file path, Telegram message ID, and status.</p>
                 </div>
               </li>
             </ul>
@@ -307,7 +313,7 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
 
           <div className="p-3 rounded-xl bg-indigo-500/10 border border-indigo-500/20 text-[11px] text-indigo-300 flex items-center space-x-2">
             <ShieldCheck className="w-4 h-4 shrink-0" />
-            <span>Storage Channel remains private and accessible only by bot admin.</span>
+            <span>Admin-only control with partial failure recovery reporting.</span>
           </div>
         </div>
       </div>
@@ -331,7 +337,7 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
               <div>
                 <h3 className="font-bold text-white text-base">{activeJob.fileName}</h3>
                 <p className="text-xs text-slate-400 font-mono">
-                  Virtual Folder: {activeJob.folderPath}/
+                  Virtual Folder: {activeJob.folderPath}/ | Mode: {activeJob.storageMode.toUpperCase()}
                 </p>
               </div>
             </div>
@@ -369,22 +375,26 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({
           </div>
 
           {/* Completed Job Info Card */}
-          {activeJob.status === 'completed' && activeJob.storageMessageId && (
+          {activeJob.status === 'completed' && (
             <div className="p-4 rounded-xl bg-emerald-950/30 border border-emerald-500/30 space-y-3">
               <div className="flex items-center space-x-2 text-emerald-400 font-bold text-sm">
                 <CheckCircle2 className="w-5 h-5" />
-                <span>Successfully Stored in Telegram Private Channel!</span>
+                <span>Successfully Stored in Selected Backends!</span>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 font-mono text-[11px] pt-1">
-                <div className="bg-slate-950/80 p-2 rounded border border-slate-800 text-slate-300">
-                  <span className="text-slate-500 block">Storage Message ID:</span>
-                  <span className="text-emerald-400 font-bold">{activeJob.storageMessageId}</span>
-                </div>
-                <div className="bg-slate-950/80 p-2 rounded border border-slate-800 text-slate-300">
-                  <span className="text-slate-500 block">Storage Channel ID:</span>
-                  <span className="truncate block text-slate-200">{activeJob.storageChannelId}</span>
-                </div>
+                {activeJob.storageMessageId && (
+                  <div className="bg-slate-950/80 p-2 rounded border border-slate-800 text-slate-300">
+                    <span className="text-slate-500 block">Telegram Msg ID:</span>
+                    <span className="text-emerald-400 font-bold">{activeJob.storageMessageId}</span>
+                  </div>
+                )}
+                {activeJob.b2Path && (
+                  <div className="bg-slate-950/80 p-2 rounded border border-slate-800 text-slate-300">
+                    <span className="text-slate-500 block">B2 Storage Path:</span>
+                    <span className="truncate block text-emerald-400">{activeJob.b2Path}</span>
+                  </div>
+                )}
                 <div className="bg-slate-950/80 p-2 rounded border border-slate-800 text-slate-300">
                   <span className="text-slate-500 block">Database Status:</span>
                   <span className="text-emerald-400 font-semibold">Metadata Recorded</span>

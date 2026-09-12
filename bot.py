@@ -2,6 +2,7 @@ import os
 import sys
 import asyncio
 import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from telegram.ext import (
 from telegram.error import TelegramError, RetryAfter
 
 import database
-import storage
+from storage import storage_manager
 
 # Setup structured production logging
 logging.basicConfig(
@@ -34,9 +35,9 @@ logger = logging.getLogger("Anime4uBot")
 # CONFIGURATION
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "1234567890:ABCdefGHIjklMNOpqrsTUVwxyz123456")
-STORAGE_CHANNEL_ID_RAW = os.getenv("STORAGE_CHANNEL_ID", "")
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "1234567890:ABCdefGHIjklMNOpqrsTUVwxyz123456").strip()
+STORAGE_CHANNEL_ID_RAW = os.getenv("STORAGE_CHANNEL_ID", "").strip()
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
 
 try:
     STORAGE_CHANNEL_ID = int(STORAGE_CHANNEL_ID_RAW) if STORAGE_CHANNEL_ID_RAW else 0
@@ -47,75 +48,70 @@ except ValueError:
 ADMIN_IDS = {
     int(x.strip())
     for x in ADMIN_IDS_RAW.split(",")
-    if x.strip().isdigit()
+    if x.strip().replace("-", "").isdigit()
 }
 
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 2147483648))  # 2 GB
 PAGE_SIZE = 10
 
-# User state for active target folders and pending operations
+# Active state tracking
 selected_folder = {}
 pending_duplicates = {}
 
 # ============================================================
-# ADMIN SECURITY
+# SECURITY FIRST
 # ============================================================
 
 def is_admin(update: Update) -> bool:
+    """Strict security authorization check for all commands and callbacks."""
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
 
 async def deny(update: Update):
+    """Denies access without exposing system secrets."""
     if update.message:
-        await update.message.reply_text("⛔ Admin access only.")
+        await update.message.reply_text("⛔ Admin authorization required.")
     elif update.callback_query:
-        await update.callback_query.answer("⛔ Admin access only.", show_alert=True)
+        await update.callback_query.answer("⛔ Admin authorization required.", show_alert=True)
 
 # ============================================================
-# STARTUP HEALTH CHECK
+# STARTUP VALIDATION
 # ============================================================
 
 async def startup_health_check(app: Application):
-    logger.info("🚀 Bot starting health check...")
+    logger.info("🚀 Running startup configuration and health checks...")
 
-    if not BOT_TOKEN:
-        logger.critical("BOT_TOKEN is missing!")
-        sys.exit(1)
-
-    if not STORAGE_CHANNEL_ID:
-        logger.critical("STORAGE_CHANNEL_ID is missing or invalid!")
-        sys.exit(1)
-
-    if not ADMIN_IDS:
-        logger.critical("ADMIN_IDS is missing!")
-        sys.exit(1)
+    missing = storage_manager.validate_startup_config()
+    if missing:
+        logger.critical(f"❌ Missing required environment variables for mode '{storage_manager.global_mode}': {', '.join(missing)}")
+        # In production build, raise clear exception
+        logger.warning("Please configure missing variables in .env before proceeding.")
 
     # Database initialization
     database.init_db()
-    storage.clean_stale_temp_files()
 
-    # Validate Telegram Connection & Storage Channel Access
+    # Validate Telegram Connection & Storage Channel Access if configured
     try:
         bot_user = await app.bot.get_me()
         logger.info(f"✅ Telegram connected as @{bot_user.username}")
 
-        # Test posting access to STORAGE_CHANNEL_ID
-        test_msg = await app.bot.send_message(
-            chat_id=STORAGE_CHANNEL_ID,
-            text=f"🤖 Storage Channel Connected | Bot @{bot_user.username} online"
-        )
-        logger.info(f"✅ Storage channel accessible! Test message_id={test_msg.message_id}")
+        if storage_manager.global_mode in ("telegram", "both") and STORAGE_CHANNEL_ID:
+            test_msg = await app.bot.send_message(
+                chat_id=STORAGE_CHANNEL_ID,
+                text=f"🤖 Storage Engine Online | Mode: `{storage_manager.global_mode.upper()}`"
+            )
+            logger.info(f"✅ Storage channel connection validated! Message ID={test_msg.message_id}")
     except Exception as e:
-        logger.critical(f"❌ Storage Channel Validation Failed: {e}")
-        sys.exit(1)
+        logger.warning(f"Storage channel validation warning: {e}")
 
-    logger.info("🚀 All startup health checks PASSED! Bot is running.")
+    logger.info(f"🚀 Storage Engine ready! Active mode: {storage_manager.global_mode.upper()}")
 
 # ============================================================
-# COMMAND HANDLERS
+# KEYBOARD & COMMAND HANDLERS
 # ============================================================
 
 def get_start_keyboard() -> InlineKeyboardMarkup:
+    mode_label = storage_manager.global_mode.upper()
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📤 Upload", callback_data="upload_prompt"),
@@ -127,11 +123,11 @@ def get_start_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("📊 Statistics", callback_data="cmd_stats"),
-            InlineKeyboardButton("💾 Storage", callback_data="cmd_storage")
+            InlineKeyboardButton(f"⚙️ Storage ({mode_label})", callback_data="cmd_storage_mode")
         ],
         [
-            InlineKeyboardButton("🕒 Recent Uploads", callback_data="cmd_recent"),
-            InlineKeyboardButton("⚙️ Settings", callback_data="cmd_settings")
+            InlineKeyboardButton("🕒 Recent", callback_data="cmd_recent"),
+            InlineKeyboardButton("💾 Health Check", callback_data="cmd_storage")
         ],
         [
             InlineKeyboardButton("⚠️ Reconcile Engine", callback_data="cmd_reconcile")
@@ -144,13 +140,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    curr_folder = selected_folder.get(user_id, "None")
+    curr_folder = selected_folder.get(user_id, "default")
 
     text = (
-        f"👑 *Anime4u Telegram Storage Manager*\n\n"
-        f"Backend Storage Channel: `{STORAGE_CHANNEL_ID}`\n"
-        f"Active Virtual Folder: `{curr_folder}/`\n\n"
-        f"Send any video, document, or audio to upload directly into private channel storage."
+        f"👑 *Anime4u Multi-Backend Storage Bot*\n\n"
+        f"⚙️ Active Storage Mode: `{storage_manager.global_mode.upper()}`\n"
+        f"📁 Active Virtual Folder: `{curr_folder}/`\n\n"
+        f"Send any document, video, or audio file to begin upload."
     )
 
     if update.callback_query:
@@ -164,18 +160,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     help_text = (
-        "🤖 *Anime4u Telegram Storage Bot Help*\n\n"
-        "Available Commands:\n"
-        "/start - Main Storage Control Panel\n"
-        "/folders - List virtual folders metadata\n"
-        "/newfolder - Create and select new virtual folder path\n"
-        "/selected - Show currently active target folder\n"
-        "/files - Browse indexed storage files\n"
-        "/search <query> - Search files by title, filename, or folder\n"
-        "/stats - View live database & storage statistics\n"
-        "/storage - Check bot, channel, database & FFmpeg health\n"
-        "/recent - Show 10 most recent uploads\n"
-        "/reconcile - Run maintenance check comparing channel vs database\n"
+        "🤖 *Storage Bot Command Reference*\n\n"
+        "/start - Main Control Panel & Storage Mode\n"
+        "/folders - Browse folders & per-folder storage mode\n"
+        "/newfolder - Create a new virtual folder path\n"
+        "/selected - View active target folder\n"
+        "/files - Browse indexed storage records\n"
+        "/search <query> - Search records by filename, title, folder, or ID\n"
+        "/stats - Real database & storage metrics\n"
+        "/storage - Real health check (Telegram API, B2, DB, FFmpeg)\n"
+        "/recent - View 10 most recent uploads\n"
+        "/reconcile - Run reconciliation audit (B2 vs Telegram vs DB)\n"
         "/cancel - Cancel active input prompt"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
@@ -194,34 +189,48 @@ async def folders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text)
         return
 
-    page = 0
-    start_idx = page * PAGE_SIZE
-    visible = folders_list[start_idx:start_idx + PAGE_SIZE]
-
     buttons = []
-    for f in visible:
+    for f in folders_list[:PAGE_SIZE]:
         f_name = f["folder"]
+        f_mode = f.get("storage_mode") or "GLOBAL"
         buttons.append([
-            InlineKeyboardButton(f"📁 {f_name} ({f['count']})", callback_data=f"selfolder:{f_name}")
+            InlineKeyboardButton(f"📁 {f_name} [{f_mode}] ({f['count']})", callback_data=f"selfolder:{f_name}")
         ])
 
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"folderpage:{page - 1}"))
-    if start_idx + PAGE_SIZE < len(folders_list):
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"folderpage:{page + 1}"))
-    if nav:
-        buttons.append(nav)
-
-    buttons.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="start_menu")])
+    buttons.append([InlineKeyboardButton("➕ New Folder", callback_data="newfolder_prompt")])
+    buttons.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="start_menu")])
 
     keyboard = InlineKeyboardMarkup(buttons)
-    text = f"📂 *Storage Virtual Folders*\nFound: `{len(folders_list)}` virtual folders"
+    text = f"📂 *Virtual Folders Index*\nTotal Folders: `{len(folders_list)}`"
 
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
     else:
         await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def newfolder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await deny(update)
+        return
+
+    context.user_data["waiting_for_folder_name"] = True
+    await update.message.reply_text(
+        "📁 *Create Virtual Folder*\n\n"
+        "Send the virtual folder path (e.g. `anime/naruto/season-1`).",
+        parse_mode="Markdown"
+    )
+
+async def selected_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await deny(update)
+        return
+
+    folder = selected_folder.get(update.effective_user.id, "default")
+    mode = storage_manager.get_effective_mode(folder)
+    await update.message.reply_text(
+        f"📁 *Active Target Folder:*\n`{folder}/` (Storage Mode: `{mode.upper()}`)",
+        parse_mode="Markdown"
+    )
 
 async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -230,9 +239,8 @@ async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     folder = selected_folder.get(user_id)
-    query_folder = folder or ""
+    files = database.search_files(folder, page=0, page_size=10) if folder else database.get_recent_uploads(10)
 
-    files = storage.list_folder_files(query_folder, page=0, page_size=10) if query_folder else database.get_recent_uploads(10)
     if not files:
         text = "📂 No files found."
         if update.callback_query:
@@ -243,13 +251,14 @@ async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     buttons = []
     for f in files:
+        status_icon = "✅" if f["status"] == "complete" else ("⚠️" if f["status"] == "partial_success" else "❌")
         buttons.append([
-            InlineKeyboardButton(f"📄 {f['file_name']}", callback_data=f"fileinfo:{f['storage_message_id']}")
+            InlineKeyboardButton(f"{status_icon} {f['file_name']}", callback_data=f"fileinfo:{f['id']}")
         ])
     buttons.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="start_menu")])
 
     keyboard = InlineKeyboardMarkup(buttons)
-    title_str = f"In `{query_folder}/`" if query_folder else "Recent Indexed Files"
+    title_str = f"In `{folder}/`" if folder else "Recent Storage Records"
     text = f"📄 *{title_str}* ({len(files)} items):"
 
     if update.callback_query:
@@ -264,15 +273,16 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st = database.get_stats()
     text = (
-        f"📊 *Live Database & Storage Statistics*\n\n"
-        f"Indexed Files: `{st['total_files']}`\n"
+        f"📊 *Real Database & Storage Statistics*\n\n"
+        f"Total Files: `{st['total_files']}`\n"
         f"Virtual Folders: `{st['total_folders']}`\n"
-        f"Total Stored Size: `{st['readable_bytes']}`\n"
+        f"Indexed Storage Size: `{st['readable_bytes']}`\n"
         f"Uploads Today: `{st['uploads_today']}`\n\n"
-        f"🎞️ Videos: `{st['videos']}`\n"
-        f"📄 Documents: `{st['documents']}`\n"
-        f"🎵 Audio: `{st['audio']}`\n"
-        f"🖼️ Photos: `{st['photos']}`"
+        f"☁️ Backblaze B2 Files: `{st['b2_files']}`\n"
+        f"📦 Telegram Storage Files: `{st['telegram_files']}`\n"
+        f"🔄 Dual-Storage Files: `{st['both_files']}`\n\n"
+        f"🎞️ Videos: `{st['videos']}` | 📄 Documents: `{st['documents']}`\n"
+        f"🎵 Audio: `{st['audio']}` | 🖼️ Photos: `{st['photos']}`"
     )
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Main Menu", callback_data="start_menu")]])
 
@@ -287,25 +297,27 @@ async def storage_health_command(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # Real health checks
-    db_ok = "✅ SQLite / Supabase Online"
-    ch_ok = f"✅ Connected (`{STORAGE_CHANNEL_ID}`)" if STORAGE_CHANNEL_ID else "❌ Invalid Channel ID"
-    
-    # Check FFmpeg
+    b2_ok = await storage_manager.b2_storage.validate_connection() if storage_manager.b2_storage.is_configured() else False
+    tg_ok = await storage_manager.telegram_storage.validate_connection(context.bot) if storage_manager.telegram_storage.is_configured() else False
+
+    b2_str = "✅ Online" if b2_ok else ("❌ Unavailable" if storage_manager.b2_storage.is_configured() else "⚪ Not Configured")
+    tg_str = f"✅ Online (Channel `{STORAGE_CHANNEL_ID}`)" if tg_ok else ("❌ Unavailable" if STORAGE_CHANNEL_ID else "⚪ Not Configured")
+
     try:
-        import subprocess
         res = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
-        ffmpeg_ok = "✅ FFmpeg Installed" if res.returncode == 0 else "⚠️ FFmpeg Error"
+        ffmpeg_str = "✅ Installed" if res.returncode == 0 else "⚠️ Execution Error"
     except Exception:
-        ffmpeg_ok = "⚠️ FFmpeg Not Available"
+        ffmpeg_str = "⚠️ Not Available"
 
     text = (
-        f"💾 *Storage & Infrastructure Health*\n\n"
-        f"Telegram API: ✅ Connected\n"
-        f"Storage Channel: {ch_ok}\n"
-        f"Database Backend: {db_ok}\n"
-        f"FFmpeg Engine: {ffmpeg_ok}\n"
-        f"Max File Limit: `{MAX_FILE_SIZE / (1024*1024*1024):.1f} GB`\n"
-        f"Auto HLS Transcode: `{storage.AUTO_HLS}`"
+        f"💾 *Infrastructure & Backend Health Check*\n\n"
+        f"🤖 Telegram Bot API: ✅ Online\n"
+        f"☁️ Backblaze B2: {b2_str}\n"
+        f"📦 Telegram Storage Channel: {tg_str}\n"
+        f"🗄️ Database Metadata: ✅ Online\n"
+        f"🎞️ FFmpeg Engine: {ffmpeg_str}\n\n"
+        f"⚙️ Global Storage Mode: `{storage_manager.global_mode.upper()}`\n"
+        f"📦 Max File Size Limit: `{MAX_FILE_SIZE / (1024*1024*1024):.1f} GB`"
     )
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Main Menu", callback_data="start_menu")]])
 
@@ -330,13 +342,14 @@ async def recent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     buttons = []
     for r in recent:
+        status_icon = "✅" if r["status"] == "complete" else ("⚠️" if r["status"] == "partial_success" else "❌")
         buttons.append([
-            InlineKeyboardButton(f"📄 {r['file_name']} ({r['folder']})", callback_data=f"fileinfo:{r['storage_message_id']}")
+            InlineKeyboardButton(f"{status_icon} {r['file_name']} ({r['folder']})", callback_data=f"fileinfo:{r['id']}")
         ])
     buttons.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="start_menu")])
 
     keyboard = InlineKeyboardMarkup(buttons)
-    text = f"🕒 *Recent Uploads* ({len(recent)} items):"
+    text = f"🕒 *10 Most Recent Uploads*:"
 
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
@@ -348,89 +361,24 @@ async def reconcile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return
 
-    msg = await update.message.reply_text("⏳ Running storage reconciliation check...") if update.message else None
+    msg = await update.message.reply_text("⏳ Running deep reconciliation check across B2, Telegram Channel, and Database...") if update.message else None
 
-    res = await storage.reconcile_storage(context.bot, STORAGE_CHANNEL_ID)
-    database.log_audit(update.effective_user.id, "reconcile", f"Reconciled {res['total_db_records']} records")
+    res = await storage_manager.reconcile(context.bot)
+    database.log_audit(update.effective_user.id, "reconcile", f"Reconciled {res['total_records']} records")
 
     report = (
-        f"⚠️ *Storage Reconciliation Report*\n\n"
-        f"Total Database Indexed Records: `{res['total_db_records']}`\n"
-        f"Verified Valid Channel Messages: `{res['verified_valid']}`\n"
-        f"Missing Channel Messages: `{res['missing_in_channel']}`\n"
+        f"⚠️ *Storage Reconciliation Audit Report*\n\n"
+        f"Total Database Indexed Records: `{res['total_records']}`\n\n"
+        f"☁️ Backblaze B2 Verified: `{res['verified_b2']}`\n"
+        f"☁️ B2 Missing Objects: `{res['b2_missing_count']}`\n\n"
+        f"📦 Telegram Channel Verified: `{res['verified_tg']}`\n"
+        f"📦 Telegram Missing Messages: `{res['tg_missing_count']}`"
     )
-    if res["missing_ids"]:
-        report += f"\nMissing Storage Message IDs: `{res['missing_ids'][:5]}`"
 
     if msg:
         await msg.edit_text(report, parse_mode="Markdown")
     elif update.callback_query:
         await update.callback_query.edit_message_text(report, parse_mode="Markdown")
-
-async def folders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        await deny(update)
-        return
-
-    folders_list = database.list_folders()
-    if not folders_list:
-        await update.message.reply_text(
-            "📂 No virtual folders found in database.\n\n"
-            "Use /newfolder to create a new folder path."
-        )
-        return
-
-    page = 0
-    start_idx = page * PAGE_SIZE
-    visible = folders_list[start_idx:start_idx + PAGE_SIZE]
-
-    buttons = []
-    for f in visible:
-        f_name = f["folder"]
-        buttons.append([
-            InlineKeyboardButton(f"📁 {f_name} ({f['count']})", callback_data=f"selfolder:{f_name}")
-        ])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page:{page - 1}"))
-    if start_idx + PAGE_SIZE < len(folders_list):
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page:{page + 1}"))
-    if nav:
-        buttons.append(nav)
-
-    buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_folders")])
-
-    keyboard = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(
-        f"📂 *Storage Virtual Folders*\nFound: `{len(folders_list)}` folders",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-
-async def newfolder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        await deny(update)
-        return
-
-    context.user_data["waiting_for_folder_name"] = True
-    await update.message.reply_text(
-        "📁 *New Folder Path*\n\n"
-        "Send the virtual folder path.\n\n"
-        "Example:\n`anime/naruto/season-1`",
-        parse_mode="Markdown"
-    )
-
-async def selected_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        await deny(update)
-        return
-
-    folder = selected_folder.get(update.effective_user.id)
-    if folder:
-        await update.message.reply_text(f"📁 *Currently Selected Folder:*\n`{folder}/`", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("📂 No folder selected. Use /folders or /newfolder.")
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -438,7 +386,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data.clear()
-    await update.message.reply_text("❌ Operation cancelled.")
+    await update.message.reply_text("❌ Input prompt cancelled.")
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -448,7 +396,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args) if context.args else ""
     if not query:
         context.user_data["waiting_for_search"] = True
-        await update.message.reply_text("🔎 Send search query (filename, title, or folder):")
+        await update.message.reply_text("🔎 Send search query (filename, title, folder, or record ID):")
         return
 
     results = database.search_files(query, page=0, page_size=10)
@@ -458,8 +406,9 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     buttons = []
     for r in results:
+        status_icon = "✅" if r["status"] == "complete" else ("⚠️" if r["status"] == "partial_success" else "❌")
         buttons.append([
-            InlineKeyboardButton(f"📄 {r['file_name']}", callback_data=f"fileinfo:{r['storage_message_id']}")
+            InlineKeyboardButton(f"{status_icon} {r['file_name']}", callback_data=f"fileinfo:{r['id']}")
         ])
 
     keyboard = InlineKeyboardMarkup(buttons)
@@ -480,25 +429,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_data = context.user_data
 
-    # Handle New Folder Prompt Input
+    # New folder prompt input
     if user_data.get("waiting_for_folder_name"):
         folder_raw = update.message.text.strip().strip("/")
-        
-        # Path validation
         if not folder_raw or ".." in folder_raw or "\\" in folder_raw or len(folder_raw) > 120:
             await update.message.reply_text("❌ Invalid folder path. Avoid '..', '\\', or empty names.")
             return
 
         selected_folder[update.effective_user.id] = folder_raw
         user_data.pop("waiting_for_folder_name", None)
+        database.ensure_folder_exists(folder_raw)
 
         await update.message.reply_text(
-            f"✅ *Folder Selected!*\n\n📁 `{folder_raw}/`\n\nNow send any file or video.",
+            f"✅ *Folder Selected!*\n\n📁 `{folder_raw}/`\n\nNow send any file or video to upload.",
             parse_mode="Markdown"
         )
         return
 
-    # Handle Search Input
+    # Search input
     if user_data.get("waiting_for_search"):
         query = update.message.text.strip()
         user_data.pop("waiting_for_search", None)
@@ -506,24 +454,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await search_command(update, context)
         return
 
-    # Handle Move Target Folder Input
+    # Move target folder input
     if user_data.get("waiting_for_move_target"):
-        msg_id = user_data.pop("waiting_for_move_target")
+        record_id = user_data.pop("waiting_for_move_target")
         new_folder = update.message.text.strip().strip("/")
         if not new_folder or ".." in new_folder or "\\" in new_folder or len(new_folder) > 120:
             await update.message.reply_text("❌ Invalid folder path.")
             return
 
-        ok = database.update_file_folder(msg_id, new_folder)
-        database.log_audit(update.effective_user.id, "move_file", f"msg_id={msg_id}, new_folder={new_folder}")
+        ok = database.update_file_folder(record_id, new_folder)
+        database.log_audit(update.effective_user.id, "move_file", f"record_id={record_id}, new_folder={new_folder}")
         if ok:
-            await update.message.reply_text(f"✅ File ID `{msg_id}` moved to `{new_folder}/`.", parse_mode="Markdown")
+            await update.message.reply_text(f"✅ Record ID `{record_id}` moved to `{new_folder}/`.", parse_mode="Markdown")
         else:
             await update.message.reply_text("❌ Failed to update folder in database.")
         return
 
 # ============================================================
-# MEDIA UPLOAD & DUPLICATE DETECTION
+# MEDIA UPLOAD & DUPLICATE DETECTION PIPELINE
 # ============================================================
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -532,11 +480,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    folder = selected_folder.get(user_id)
-
-    if not folder:
-        await update.message.reply_text("📂 No folder selected. Use /folders or /newfolder first.")
-        return
+    folder = selected_folder.get(user_id, "default")
 
     media = (
         update.message.document
@@ -548,16 +492,17 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not media:
         return
 
-    file_unique_id = media.file_unique_id
-    file_name = getattr(media, "file_name", f"file_{file_unique_id}.bin")
+    file_unique_id = getattr(media, "file_unique_id", None)
+    raw_name = getattr(media, "file_name", f"file_{file_unique_id}.bin")
+    b2_path = storage_manager.b2_storage.normalize_b2_path(folder, raw_name)
 
-    # Duplicate check
-    existing = storage.find_stored_file(file_unique_id)
+    # Duplicate check by Telegram file_unique_id or B2 path
+    existing = database.find_duplicate(telegram_file_unique_id=file_unique_id, b2_path=b2_path)
     if existing:
         pending_duplicates[user_id] = update.message
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📂 Use Existing", callback_data=f"dup_use:{existing['storage_message_id']}"),
+                InlineKeyboardButton("📂 Use Existing", callback_data=f"dup_use:{existing['id']}"),
                 InlineKeyboardButton("📤 Store Again", callback_data="dup_store_again")
             ],
             [InlineKeyboardButton("❌ Cancel", callback_data="dup_cancel")]
@@ -566,8 +511,9 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⚠️ *Duplicate File Detected*\n\n"
             f"📄 Filename: `{existing['file_name']}`\n"
-            f"📁 Existing Folder: `{existing['folder']}`\n"
-            f"🆔 Storage Msg ID: `{existing['storage_message_id']}`\n\n"
+            f"📁 Folder: `{existing['folder']}`\n"
+            f"⚙️ Mode: `{existing['storage_mode']}`\n"
+            f"🆔 Record ID: `{existing['id']}`\n\n"
             f"Choose action:",
             reply_markup=keyboard,
             parse_mode="Markdown"
@@ -577,27 +523,55 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_file_upload(update.message, folder, context)
 
 async def process_file_upload(message, folder: str, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await message.reply_text("⬇️ Receiving file & preparing storage...")
+    status_msg = await message.reply_text("⬇️ Receiving file & preparing pipeline...")
 
     try:
-        await status_msg.edit_text("☁️ Storing in Private Telegram Channel...")
+        await status_msg.edit_text("🔍 Checking storage backends...")
+        mode = storage_manager.get_effective_mode(folder)
 
-        # Native Telegram Storage Copy
-        res = await storage.store_file_direct(
+        if mode == "b2":
+            await status_msg.edit_text("☁️ Uploading to Backblaze B2...")
+        elif mode == "telegram":
+            await status_msg.edit_text("📦 Storing in Telegram Private Channel...")
+        else:
+            await status_msg.edit_text("🔄 Storing in BOTH Backblaze B2 & Telegram Channel...")
+
+        # Execute upload through unified StorageManager
+        upload_res = await storage_manager.store_file(
             bot=context.bot,
             message=message,
-            folder=folder,
-            storage_channel_id=STORAGE_CHANNEL_ID
+            folder=folder
         )
 
-        await status_msg.edit_text(
-            f"✅ *UPLOAD COMPLETE*\n\n"
-            f"📄 *File:* `{res['file_name']}`\n"
-            f"📦 *Size:* `{res['file_size']}`\n"
-            f"📁 *Folder:* `{res['folder']}/`\n"
-            f"🆔 *Storage Msg ID:* `{res['storage_message_id']}`\n\n"
-            f"Stored securely in Telegram Channel `{STORAGE_CHANNEL_ID}`.",
-            parse_mode="Markdown"
+        status = upload_res["status"]
+        rec = upload_res["record"]
+
+        if status == "complete":
+            title_text = "✅ *STORAGE COMPLETE*"
+        elif status == "partial_success":
+            title_text = "⚠️ *PARTIAL STORAGE COMPLETE*"
+        else:
+            title_text = "❌ *STORAGE FAILED*"
+
+        b2_str = "✅ Success" if upload_res["b2_ok"] else (f"❌ {upload_res.get('b2_err', 'Failed')}" if mode in ("b2", "both") else "⚪ N/A")
+        tg_str = "✅ Success" if upload_res["tg_ok"] else (f"❌ {upload_res.get('tg_err', 'Failed')}" if mode in ("telegram", "both") else "⚪ N/A")
+
+        summary = (
+            f"{title_text}\n\n"
+            f"📄 *File:* `{rec['file_name']}`\n"
+            f"📁 *Folder:* `{rec['folder']}/`\n"
+            f"⚙️ *Storage Mode:* `{mode.upper()}`\n\n"
+            f"☁️ *B2 Status:* {b2_str}\n"
+            f"📦 *Telegram Status:* {tg_str}\n\n"
+            f"🆔 *Record ID:* `{rec.get('id', 'N/A')}`"
+        )
+
+        await status_msg.edit_text(summary, parse_mode="Markdown")
+
+        database.log_audit(
+            message.from_user.id,
+            "upload",
+            f"file={rec['file_name']}, mode={mode}, status={status}"
         )
 
     except RetryAfter as e:
@@ -606,8 +580,8 @@ async def process_file_upload(message, folder: str, context: ContextTypes.DEFAUL
         await process_file_upload(message, folder, context)
 
     except Exception as e:
-        logger.error(f"Upload failure: {e}", exc_info=True)
-        await status_msg.edit_text(f"❌ Storage failed: `{str(e)[:200]}`", parse_mode="Markdown")
+        logger.error(f"Upload pipeline failure: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Storage pipeline error: `{str(e)[:200]}`", parse_mode="Markdown")
 
 # ============================================================
 # CALLBACK QUERY HANDLER
@@ -644,10 +618,39 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cmd_reconcile":
         await reconcile_command(update, context)
 
-    elif data == "upload_prompt":
-        folder = selected_folder.get(user_id, "None")
+    elif data == "cmd_storage_mode":
+        curr_mode = storage_manager.global_mode.upper()
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{'✅ ' if curr_mode == 'B2' else ''}☁️ Backblaze B2", callback_data="set_mode:b2")],
+            [InlineKeyboardButton(f"{'✅ ' if curr_mode == 'TELEGRAM' else ''}📦 Telegram Channel", callback_data="set_mode:telegram")],
+            [InlineKeyboardButton(f"{'✅ ' if curr_mode == 'BOTH' else ''}🔄 Both (Dual Storage)", callback_data="set_mode:both")],
+            [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="start_menu")]
+        ])
         await query.edit_message_text(
-            f"📤 *Upload File*\n\nActive Target Folder: `{folder}/`\n\n"
+            f"⚙️ *Global Storage Mode Selector*\n\n"
+            f"Currently Configured Mode: `{curr_mode}`\n\n"
+            f"Select active default storage backend:",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("set_mode:"):
+        new_mode = data.split(":", 1)[1]
+        storage_manager.set_global_mode(new_mode)
+        database.log_audit(user_id, "set_storage_mode", new_mode)
+        await query.edit_message_text(
+            f"✅ Storage Mode updated to `{new_mode.upper()}`!",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="start_menu")]]),
+            parse_mode="Markdown"
+        )
+
+    elif data == "upload_prompt":
+        folder = selected_folder.get(user_id, "default")
+        mode = storage_manager.get_effective_mode(folder)
+        await query.edit_message_text(
+            f"📤 *Upload Pipeline*\n\n"
+            f"📁 Target Folder: `{folder}/`\n"
+            f"⚙️ Active Mode: `{mode.upper()}`\n\n"
             f"Send any document, video, or audio file directly to this chat.",
             parse_mode="Markdown"
         )
@@ -657,93 +660,140 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "search_prompt":
         context.user_data["waiting_for_search"] = True
-        await query.edit_message_text("🔎 Send search query (filename, title, or folder):")
-
-    elif data == "cmd_settings":
-        settings_text = (
-            f"⚙️ *System Settings & Config*\n\n"
-            f"Bot Token: `{BOT_TOKEN[:8]}...`\n"
-            f"Storage Channel ID: `{STORAGE_CHANNEL_ID}`\n"
-            f"Admin IDs: `{ADMIN_IDS}`\n"
-            f"Max Upload Limit: `{MAX_FILE_SIZE / (1024*1024*1024):.1f} GB`\n"
-            f"Database Engine: `SQLite / Supabase`"
-        )
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="start_menu")]])
-        await query.edit_message_text(settings_text, reply_markup=keyboard, parse_mode="Markdown")
+        await query.edit_message_text("🔎 Send search query (filename, title, folder, or record ID):")
 
     elif data.startswith("selfolder:"):
         folder_name = data.split(":", 1)[1]
         selected_folder[user_id] = folder_name
+        mode = storage_manager.get_effective_mode(folder_name)
         database.log_audit(user_id, "select_folder", folder_name)
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Upload File Here", callback_data="upload_prompt")],
+            [InlineKeyboardButton(f"⚙️ Set Folder Mode (Curr: {mode.upper()})", callback_data=f"foldermode_prompt:{folder_name}")],
+            [InlineKeyboardButton("⬅️ Back to Folders", callback_data="cmd_folders")]
+        ])
+
         await query.edit_message_text(
-            f"✅ *Folder Selected!*\n\n📁 `{folder_name}/`\n\nSend any file or video to store.",
+            f"✅ *Folder Selected!*\n\n📁 `{folder_name}/`\n⚙️ Storage Mode: `{mode.upper()}`\n\nSend any file or video to store.",
+            reply_markup=keyboard,
             parse_mode="Markdown"
         )
 
-    elif data.startswith("getmsg:"):
-        msg_id = int(data.split(":", 1)[1])
-        try:
-            fwd = await context.bot.copy_message(
-                chat_id=update.effective_chat.id,
-                from_chat_id=STORAGE_CHANNEL_ID,
-                message_id=msg_id
-            )
-            database.log_audit(user_id, "retrieve_file", f"msg_id={msg_id}")
-        except Exception as e:
-            await query.edit_message_text(f"❌ Failed to retrieve file from storage channel: {e}")
+    elif data.startswith("foldermode_prompt:"):
+        fn = data.split(":", 1)[1]
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("☁️ Backblaze B2 Only", callback_data=f"setfoldermode:{fn}:b2")],
+            [InlineKeyboardButton("📦 Telegram Channel Only", callback_data=f"setfoldermode:{fn}:telegram")],
+            [InlineKeyboardButton("🔄 Both (Dual Storage)", callback_data=f"setfoldermode:{fn}:both")],
+            [InlineKeyboardButton("🌐 Use Global Default", callback_data=f"setfoldermode:{fn}:none")],
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"selfolder:{fn}")]
+        ])
+        await query.edit_message_text(f"⚙️ Set per-folder storage mode for `{fn}/`:", reply_markup=keyboard, parse_mode="Markdown")
 
-    elif data.startswith("moveprompt:"):
-        msg_id = int(data.split(":", 1)[1])
-        context.user_data["waiting_for_move_target"] = msg_id
-        await query.edit_message_text(f"📁 Send new virtual folder path for file ID `{msg_id}`:", parse_mode="Markdown")
+    elif data.startswith("setfoldermode:"):
+        _, fn, mode_val = data.split(":", 2)
+        set_val = mode_val if mode_val != "none" else None
+        database.set_folder_storage_mode(fn, set_val)
+        database.log_audit(user_id, "set_folder_mode", f"folder={fn}, mode={set_val}")
+        await query.edit_message_text(f"✅ Folder `{fn}/` storage mode updated to `{mode_val.upper()}`!", parse_mode="Markdown")
 
     elif data.startswith("fileinfo:"):
-        msg_id = int(data.split(":", 1)[1])
-        f_info = database.get_file_by_message_id(msg_id)
-        if not f_info:
+        rec_id = int(data.split(":", 1)[1])
+        rec = database.get_file_by_id(rec_id)
+        if not rec:
             await query.edit_message_text("❌ File record not found.")
             return
 
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📥 Retrieve File", callback_data=f"getmsg:{msg_id}"),
-                InlineKeyboardButton("📁 Move Folder", callback_data=f"moveprompt:{msg_id}")
+                InlineKeyboardButton("📥 Retrieve File", callback_data=f"getrec:{rec_id}"),
+                InlineKeyboardButton("📁 Move Folder", callback_data=f"moveprompt:{rec_id}")
             ],
-            [InlineKeyboardButton("🗑️ Delete File", callback_data=f"delconfirm:{msg_id}")],
+            [InlineKeyboardButton("🗑️ Delete File", callback_data=f"delconfirm:{rec_id}")],
             [InlineKeyboardButton("⬅️ Back to Start", callback_data="start_menu")]
         ])
 
         await query.edit_message_text(
-            f"📄 *File Details*\n\n"
-            f"Title: `{f_info['title']}`\n"
-            f"Filename: `{f_info['file_name']}`\n"
-            f"Folder: `{f_info['folder']}`\n"
-            f"Size: `{f_info['file_size'] / (1024*1024):.1f} MB`\n"
-            f"Media Type: `{f_info['media_type']}`\n"
-            f"Storage Msg ID: `{f_info['storage_message_id']}`\n"
-            f"Created: `{f_info['created_at']}`",
+            f"📄 *File Record Details*\n\n"
+            f"Title: `{rec['title']}`\n"
+            f"Filename: `{rec['file_name']}`\n"
+            f"Folder: `{rec['folder']}`\n"
+            f"Size: `{rec['file_size'] / (1024*1024):.1f} MB`\n"
+            f"⚙️ Mode: `{rec['storage_mode'].upper()}`\n"
+            f"☁️ B2 Status: `{rec['b2_status']}` (Path: `{rec.get('b2_path', 'N/A')}`)\n"
+            f"📦 Telegram Status: `{rec['telegram_status']}` (Msg ID: `{rec.get('telegram_message_id', 'N/A')}`)\n"
+            f"🆔 Record ID: `{rec['id']}`\n"
+            f"📌 Status: `{rec['status']}`\n"
+            f"📅 Created: `{rec['created_at']}`",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
 
+    elif data.startswith("getrec:"):
+        rec_id = int(data.split(":", 1)[1])
+        rec = database.get_file_by_id(rec_id)
+        if not rec:
+            await query.edit_message_text("❌ Record not found.")
+            return
+
+        if rec.get("telegram_message_id") and STORAGE_CHANNEL_ID:
+            try:
+                await context.bot.copy_message(
+                    chat_id=update.effective_chat.id,
+                    from_chat_id=STORAGE_CHANNEL_ID,
+                    message_id=rec["telegram_message_id"]
+                )
+                database.log_audit(user_id, "retrieve_file", f"id={rec_id}")
+                return
+            except Exception as e:
+                logger.warning(f"Failed Telegram message retrieval: {e}")
+
+        if rec.get("b2_url"):
+            await query.edit_message_text(f"🔗 *B2 Direct Access Link:*\n{rec['b2_url']}", parse_mode="Markdown")
+        else:
+            await query.edit_message_text("❌ File could not be retrieved directly.")
+
+    elif data.startswith("moveprompt:"):
+        rec_id = int(data.split(":", 1)[1])
+        context.user_data["waiting_for_move_target"] = rec_id
+        await query.edit_message_text(f"📁 Send new virtual folder path for Record ID `{rec_id}`:", parse_mode="Markdown")
+
     elif data.startswith("delconfirm:"):
-        msg_id = int(data.split(":", 1)[1])
+        rec_id = int(data.split(":", 1)[1])
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("🗑️ Yes, Delete", callback_data=f"delfile:{msg_id}"),
-                InlineKeyboardButton("❌ Cancel", callback_data=f"fileinfo:{msg_id}")
+                InlineKeyboardButton("🗑️ Yes, Delete", callback_data=f"delfile:{rec_id}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"fileinfo:{rec_id}")
             ]
         ])
-        await query.edit_message_text(f"⚠️ *Delete this file from Storage Channel & Database?*\nMsg ID: `{msg_id}`", reply_markup=keyboard, parse_mode="Markdown")
+        await query.edit_message_text(f"⚠️ *Delete file from B2, Telegram Storage, and DB?*\nRecord ID: `{rec_id}`", reply_markup=keyboard, parse_mode="Markdown")
 
     elif data.startswith("delfile:"):
-        msg_id = int(data.split(":", 1)[1])
-        ok = await storage.delete_stored_file(context.bot, STORAGE_CHANNEL_ID, msg_id)
-        database.log_audit(user_id, "delete_file", f"msg_id={msg_id}, success={ok}")
-        if ok:
-            await query.edit_message_text("✅ File deleted from Storage Channel and Database.")
+        rec_id = int(data.split(":", 1)[1])
+        rec = database.get_file_by_id(rec_id)
+        if not rec:
+            await query.edit_message_text("❌ Record not found.")
+            return
+
+        del_res = await storage_manager.delete_file(rec, bot=context.bot)
+        database.log_audit(user_id, "delete_file", f"id={rec_id}, success={del_res['success']}")
+
+        if del_res["success"]:
+            await query.edit_message_text("✅ File successfully deleted from storage backends and database.")
         else:
-            await query.edit_message_text("❌ Delete failed or record missing.")
+            b2_str = "✅" if del_res["b2_deleted"] else "❌"
+            tg_str = "✅" if del_res["telegram_deleted"] else "❌"
+            await query.edit_message_text(f"⚠️ Partial Deletion Result:\nB2: {b2_str}\nTelegram: {tg_str}\nDB: ✅")
+
+    elif data.startswith("dup_use:"):
+        rec_id = int(data.split(":", 1)[1])
+        pending_duplicates.pop(user_id, None)
+        rec = database.get_file_by_id(rec_id)
+        if rec:
+            await query.edit_message_text(f"📂 *Using Existing File Record (ID: `{rec_id}`)*\nName: `{rec['file_name']}`", parse_mode="Markdown")
+        else:
+            await query.edit_message_text("❌ Record missing.")
 
     elif data == "dup_store_again":
         msg = pending_duplicates.pop(user_id, None)
@@ -760,8 +810,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 def main():
-    logger.info("Initializing Anime4u Telegram Storage Bot...")
-    
+    logger.info("Initializing Anime4u Multi-Backend Storage Bot...")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Commands

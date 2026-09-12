@@ -10,7 +10,17 @@ services:
         sync: false
       - key: ADMIN_IDS
         sync: false
+      - key: STORAGE_MODE
+        value: "telegram"
       - key: STORAGE_CHANNEL_ID
+        sync: false
+      - key: B2_APPLICATION_KEY_ID
+        sync: false
+      - key: B2_APPLICATION_KEY
+        sync: false
+      - key: B2_BUCKET_NAME
+        sync: false
+      - key: B2_PUBLIC_BASE_URL
         sync: false
       - key: MAX_FILE_SIZE
         value: "2147483648"

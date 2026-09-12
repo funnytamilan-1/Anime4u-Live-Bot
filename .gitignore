@@ -1,0 +1,8 @@
+.env
+.env.*
+downloads/
+*.log
+*.db
+__pycache__/
+node_modules/
+dist/

@@ -35,7 +35,7 @@ logger = logging.getLogger("Anime4uBot")
 # CONFIGURATION
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "1234567890:ABCdefGHIjklMNOpqrsTUVwxyz123456").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8769661029:AAED5_SSFoU-Q_xQ_-p-x5FqzU7J9MZcIaE").strip()
 STORAGE_CHANNEL_ID_RAW = os.getenv("STORAGE_CHANNEL_ID", "").strip()
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
 

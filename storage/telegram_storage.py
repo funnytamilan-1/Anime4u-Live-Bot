@@ -9,7 +9,7 @@ logger = logging.getLogger("TelegramStorage")
 
 class TelegramStorage(BaseStorage):
     def __init__(self):
-        raw_ch = os.getenv("STORAGE_CHANNEL_ID", "").strip()
+        raw_ch = os.getenv("STORAGE_CHANNEL_ID", "-1004364304959").strip()
         self.storage_channel_id = int(raw_ch) if raw_ch else None
         self.max_file_size = int(os.getenv("MAX_FILE_SIZE", 2147483648))
 

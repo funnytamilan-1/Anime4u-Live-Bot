@@ -3,8 +3,13 @@ import sys
 import asyncio
 import logging
 import subprocess
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from telegram import (
     Update,
@@ -30,6 +35,30 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger("Anime4uBot")
+
+# ============================================================
+# HTTP HEALTH CHECK SERVER FOR CLOUD RUN / RENDER
+# ============================================================
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK - Anime4u Storage Bot Online")
+
+    def log_message(self, format, *args):
+        pass
+
+def start_health_check_server():
+    try:
+        port = int(os.getenv("PORT", 3000))
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info(f"🌐 Health check HTTP server bound and listening on 0.0.0.0:{port}")
+    except Exception as e:
+        logger.warning(f"Could not start HTTP health check server: {e}")
 
 # ============================================================
 # CONFIGURATION
@@ -839,6 +868,9 @@ def main():
     # Run Startup Health Check before polling
     loop = asyncio.get_event_loop()
     loop.run_until_complete(startup_health_check(app))
+
+    # Start HTTP Health Check Server for Render Web Services & Cloud Run port binding
+    start_health_check_server()
 
     logger.info("🚀 Polling started. Listening for admin requests...")
     app.run_polling()

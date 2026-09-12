@@ -8,8 +8,8 @@ logger = logging.getLogger("B2Storage")
 
 class B2Storage(BaseStorage):
     def __init__(self):
-        self.key_id = os.getenv("B2_APPLICATION_KEY_ID", "").strip()
-        self.application_key = os.getenv("B2_APPLICATION_KEY", "").strip()
+        self.key_id = os.getenv("B2_APPLICATION_KEY_ID", "0054467fa469dc20000000002").strip()
+        self.application_key = os.getenv("B2_APPLICATION_KEY", "K005ACvE5pP0RYQr4cplDYDSE96uMtA").strip()
         self.bucket_name = os.getenv("B2_BUCKET_NAME", "anime4u-videos").strip()
         self.public_base_url = os.getenv("B2_PUBLIC_BASE_URL", "").rstrip("/")
         self._bucket = None

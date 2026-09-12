@@ -1,0 +1,8 @@
+{
+  "name": "Anime4u Live Bot & Stream Manager",
+  "description": "Auto HLS Remuxer, Backblaze B2 uploader, and Supabase live stream management dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

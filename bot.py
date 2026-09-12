@@ -26,7 +26,7 @@ from b2sdk.v2 import B2Api, InMemoryAccountInfo
 # CONFIGURATION
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8769661029:AAED5_SSFoU-Q_xQ_-p-x5FqzU7J9MZcIaE")
 
 B2_APPLICATION_KEY_ID = os.getenv(
     "B2_APPLICATION_KEY_ID"

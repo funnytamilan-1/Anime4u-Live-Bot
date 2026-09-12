@@ -24,7 +24,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import TelegramError, RetryAfter
+from telegram.error import TelegramError, RetryAfter, Conflict
 
 import database
 from storage import storage_manager
@@ -834,6 +834,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_duplicates.pop(user_id, None)
         await query.edit_message_text("❌ Upload cancelled.")
 
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, Conflict):
+        logger.warning(
+            "⚠️ Telegram Conflict (409): Another instance is currently polling with this bot token, "
+            "or a Render zero-downtime container transition is in progress. Polling will auto-resume."
+        )
+    else:
+        logger.error(f"Unhandled bot exception: {context.error}", exc_info=context.error)
+
 # ============================================================
 # MAIN APPLICATION ENTRY POINT
 # ============================================================
@@ -842,6 +851,7 @@ def main():
     logger.info("Initializing Anime4u Multi-Backend Storage Bot...")
 
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(global_error_handler)
 
     # Commands
     app.add_handler(CommandHandler("start", start))
@@ -873,7 +883,7 @@ def main():
     start_health_check_server()
 
     logger.info("🚀 Polling started. Listening for admin requests...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()

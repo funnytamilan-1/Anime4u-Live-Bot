@@ -2777,9 +2777,13 @@ def main():
 
         async def post_init(application: Application):
             nonlocal worker_task_all
-            await safe_run_diagnostics()
+            await run_worker_diagnostics()
             await get_telethon_client()
-            worker_task_all = asyncio.create_task(run_worker_loop_core(bot_instance=application.bot))
+            worker_lifecycle.state = WorkerState.RUNNING
+            worker_lifecycle.bot_instance = application.bot
+            global worker_running
+            worker_running = True
+            worker_task_all = asyncio.create_task(worker_lifecycle._worker_loop_core())
 
         async def post_shutdown(application: Application):
             nonlocal worker_task_all

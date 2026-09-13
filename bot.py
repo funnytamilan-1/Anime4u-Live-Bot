@@ -41,8 +41,8 @@ logger = logging.getLogger("B2MediaStorageBot")
 # 1. CONFIGURATION & ENVIRONMENT VARIABLES
 # ============================================================
 
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-ADMIN_IDS_RAW = (os.getenv("ADMIN_IDS") or "").strip()
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "8769661029:AAED5_SSFoU-Q_xQ_-p-x5FqzU7J9MZcIaE").strip()
+ADMIN_IDS_RAW = (os.getenv("ADMIN_IDS") or "5192451273").strip()
 
 ADMIN_IDS: Set[int] = set()
 if ADMIN_IDS_RAW:
@@ -54,8 +54,8 @@ if ADMIN_IDS_RAW:
             except ValueError:
                 pass
 
-B2_APPLICATION_KEY_ID = (os.getenv("B2_APPLICATION_KEY_ID") or "").strip()
-B2_APPLICATION_KEY = (os.getenv("B2_APPLICATION_KEY") or "").strip()
+B2_APPLICATION_KEY_ID = (os.getenv("B2_APPLICATION_KEY_ID") or "0054467fa469dc20000000002").strip()
+B2_APPLICATION_KEY = (os.getenv("B2_APPLICATION_KEY") or "K005ACvE5pP0RYQr4cplDYDSE96uMtA").strip()
 B2_BUCKET_NAME = (os.getenv("B2_BUCKET_NAME") or "anime4u-videos").strip()
 B2_PUBLIC_BASE_URL = (os.getenv("B2_PUBLIC_BASE_URL") or "").rstrip("/")
 

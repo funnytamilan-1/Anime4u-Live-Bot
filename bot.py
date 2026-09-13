@@ -635,7 +635,8 @@ async def probe_media(file_path: Path) -> Dict[str, Any]:
 async def process_video_for_web(
     input_path: Path,
     output_path: Path,
-    media_info: Dict[str, Any]
+    media_info: Dict[str, Any],
+    progress_callback: Optional[Any] = None
 ) -> Tuple[bool, str, str]:
     ffmpeg_ok, _ = check_ffmpeg_installed()
     if not ffmpeg_ok:
@@ -644,54 +645,175 @@ async def process_video_for_web(
     v_codec = (media_info.get("video_codec") or "").lower()
     a_codec = (media_info.get("audio_codec") or "").lower()
     pix_fmt = (media_info.get("pix_fmt") or "").lower()
+    total_duration = media_info.get("duration") or 0.0
 
     is_h264_compatible = v_codec in ["h264", "avc1"] and pix_fmt in ["yuv420p", "yuvj420p", ""]
     is_aac_compatible = a_codec in ["aac"]
 
+    if is_h264_compatible:
+        mode = "remux_fastpath"
+        cmd = [
+            "ffmpeg", "-y",
+            "-progress", "pipe:1",
+            "-nostats",
+            "-i", str(input_path),
+            "-c:v", "copy",
+            "-c:a", "copy" if is_aac_compatible else "aac",
+        ]
+        if not is_aac_compatible and a_codec:
+            cmd.extend(["-b:a", "128k"])
+        cmd.extend(["-movflags", "+faststart", str(output_path)])
+    else:
+        mode = "transcode_h264"
+        cmd = [
+            "ffmpeg", "-y",
+            "-progress", "pipe:1",
+            "-nostats",
+            "-i", str(input_path),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy" if is_aac_compatible else "aac",
+        ]
+        if not is_aac_compatible and a_codec:
+            cmd.extend(["-b:a", "128k"])
+        cmd.extend(["-movflags", "+faststart", str(output_path)])
+
+    logger.info("[FFMPEG] Starting")
+    logger.info(f"[FFMPEG] Input: {input_path.name}")
+    logger.info(f"[FFMPEG] Input codec: {v_codec}")
+    logger.info(f"[FFMPEG] Output codec: {'copy' if is_h264_compatible else 'h264'}")
+    logger.info(f"[FFMPEG] Duration: {total_duration}s")
+    logger.info(f"[FFMPEG] Output: {output_path.resolve()}")
+    logger.info(f"[FFMPEG] Command: {' '.join(cmd)}")
+
     async with FFMPEG_SEMAPHORE:
-        if is_h264_compatible:
-            mode = "remux_fastpath"
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", str(input_path),
-                "-c:v", "copy",
-                "-c:a", "copy" if is_aac_compatible else "aac",
-            ]
-            if not is_aac_compatible and a_codec:
-                cmd.extend(["-b:a", "128k"])
-            cmd.extend(["-movflags", "+faststart", str(output_path)])
-        else:
-            mode = "transcode_h264"
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", str(input_path),
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "23",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-movflags", "+faststart",
-                str(output_path)
-            ]
-
-        logger.info(f"Executing FFmpeg [{mode}]: {' '.join(cmd)}")
-
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
 
-        _, stderr = await proc.communicate()
+        stderr_chunks = []
+        async def read_stderr():
+            while True:
+                chunk = await proc.stderr.read(4096)
+                if not chunk:
+                    break
+                stderr_chunks.append(chunk)
+
+        stderr_task = asyncio.create_task(read_stderr())
+
+        out_time_sec = 0.0
+        speed_str = "0x"
+        fps_str = "0"
+        last_log_time = time.time()
+        last_progress_time = time.time()
+        main_loop = asyncio.get_running_loop()
+
+        def format_sec(sec: float) -> str:
+            if not sec or sec <= 0:
+                return "00:00:00"
+            m, s = divmod(int(sec), 60)
+            h, m = divmod(m, 60)
+            return f"{h:02d}:{m:02d}:{s:02d}"
+
+        while True:
+            # Check for stall timeout (120 seconds of no progress)
+            now = time.time()
+            if now - last_progress_time > 120.0:
+                logger.error("[FFMPEG] Error: Process stalled for > 120 seconds without progress output. Terminating.")
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
+
+            try:
+                line_bytes = await asyncio.wait_for(proc.stdout.readline(), timeout=5.0)
+            except asyncio.TimeoutError:
+                if proc.returncode is not None:
+                    break
+                continue
+
+            if not line_bytes:
+                break
+
+            line = line_bytes.decode("utf-8", errors="ignore").strip()
+            if "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip()
+
+                if key in ["out_time_us", "out_time_ms"]:
+                    try:
+                        out_time_sec = float(value) / 1000000.0
+                    except ValueError:
+                        pass
+                elif key == "out_time":
+                    try:
+                        parts = value.split(":")
+                        if len(parts) == 3:
+                            h, m, s = float(parts[0]), float(parts[1]), float(parts[2])
+                            out_time_sec = h * 3600 + m * 60 + s
+                    except ValueError:
+                        pass
+                elif key == "speed":
+                    speed_str = value
+                elif key == "fps":
+                    fps_str = value
+                elif key == "progress":
+                    last_progress_time = now
+                    pct = 0
+                    if total_duration > 0:
+                        pct = int(min(100.0, max(0.0, (out_time_sec / total_duration) * 100.0)))
+
+                    if now - last_log_time >= 2.0:
+                        last_log_time = now
+                        logger.info(f"[FFMPEG] progress={pct}% out_time={format_sec(out_time_sec)} speed={speed_str} fps={fps_str}")
+
+                    if progress_callback:
+                        asyncio.run_coroutine_threadsafe(
+                            progress_callback(pct, out_time_sec, speed_str, fps_str, total_duration, mode),
+                            loop=main_loop
+                        )
+
+        await proc.wait()
+        await stderr_task
+
+        stderr_output = b"".join(stderr_chunks).decode("utf-8", errors="ignore")
 
         if proc.returncode != 0:
-            err_log = stderr.decode("utf-8", errors="ignore")[-500:]
-            logger.error(f"FFmpeg process error: {err_log}")
-            return False, mode, f"FFmpeg failed (code {proc.returncode}): {err_log}"
+            err_log = stderr_output[-1000:]
+            logger.error(f"[FFMPEG] Exit code: {proc.returncode}")
+            logger.error(f"[FFMPEG] Error: {err_log}")
+            return False, mode, f"FFmpeg failed with exit code {proc.returncode}: {err_log}"
 
+        # Output Validation
         if not output_path.exists() or output_path.stat().st_size == 0:
-            return False, mode, "FFmpeg output file is missing or 0 bytes."
+            logger.error("[FFMPEG] Output validation failed: File missing or 0 bytes.")
+            return False, mode, "FFmpeg output file missing or 0 bytes."
+
+        try:
+            out_probe = await probe_media(output_path)
+            out_vcodec = (out_probe.get("video_codec") or "").lower()
+            out_format = (out_probe.get("format_name") or "").lower()
+            out_dur = out_probe.get("duration") or 0.0
+
+            if out_vcodec not in ["h264", "avc1"]:
+                logger.error(f"[FFMPEG] Validation failed: Video codec is '{out_vcodec}', expected 'h264'.")
+                return False, mode, f"Validation failed: Output video codec is '{out_vcodec}'"
+
+            if "mp4" not in out_format and "mov" not in out_format:
+                logger.error(f"[FFMPEG] Validation failed: Container is '{out_format}', expected 'mp4'.")
+                return False, mode, f"Validation failed: Container format is '{out_format}'"
+
+            logger.info(f"[FFMPEG] Output Validation PASS: Size={format_size(output_path.stat().st_size)}, Codec={out_vcodec}, Format={out_format}, Duration={out_dur}s")
+
+        except Exception as ve:
+            logger.error(f"[FFMPEG] Output validation error: {ve}")
+            return False, mode, f"Output validation probe failed: {ve}"
 
         return True, mode, "Success"
 
@@ -903,6 +1025,7 @@ async def run_worker_loop(ptb_app: Optional[Application] = None):
             await asyncio.sleep(3.0)
 
 async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]):
+    t_job_claimed = time.time()
     job_id = job["job_id"]
     chat_id = job["chat_id"]
     message_id = job["message_id"]
@@ -911,7 +1034,16 @@ async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]
     file_size = job["source_file_size"]
     folder = job["folder"]
 
-    logger.info(f"Worker picking up job {job_id} for file '{original_filename}' ({format_size(file_size)})")
+    # Calculate queue wait time
+    created_at_str = job.get("created_at") or ""
+    try:
+        from datetime import datetime
+        created_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+        queue_wait_sec = round(t_job_claimed - created_dt.timestamp(), 2)
+    except Exception:
+        queue_wait_sec = 0.0
+
+    logger.info(f"Worker picking up job {job_id} for file '{original_filename}' ({format_size(file_size)}) [PERF Queue Wait: {queue_wait_sec}s]")
     update_job(job_id, {"status": "DOWNLOADING", "progress_stage": "DOWNLOADING", "progress_percent": 0})
 
     bot_client = ptb_app.bot if ptb_app else None
@@ -978,6 +1110,7 @@ async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]
 
     try:
         # 2. MTProto Download
+        t_dl_start = time.time()
         if API_ID and API_HASH and TELETHON_AVAILABLE:
             def format_time(seconds: float) -> str:
                 if seconds <= 0:
@@ -1030,7 +1163,12 @@ async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]
             tg_file = await bot_client.get_file(job["tg_file_id"])
             await tg_file.download_to_drive(custom_path=local_download_path)
 
+        dl_dur = round(time.time() - t_dl_start, 2)
+        dl_mbps = round((file_size / (1024 * 1024)) / dl_dur, 2) if dl_dur > 0 else 0.0
+        logger.info(f"[PERF] Job {job_id} | Queue wait: {queue_wait_sec} s | Download: {dl_mbps} MB/s ({dl_dur} s)")
+
         # 3. FFprobe Inspection
+        t_probe_start = time.time()
         update_job(job_id, {"status": "INSPECTING", "progress_stage": "INSPECTING"})
         await notify_ui(
             "🎬 *Inspecting Media Properties*\n\n"
@@ -1046,29 +1184,74 @@ async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]
         except Exception as e:
             logger.warning(f"FFprobe note for job {job_id}: {e}")
 
+        probe_ms = int((time.time() - t_probe_start) * 1000)
+        logger.info(f"[PERF] Job {job_id} | FFprobe: {probe_ms} ms")
+
         # 4. Processing (Remux / Transcode vs Passthrough)
+        t_proc_start = time.time()
         if is_video:
             v_codec = media_info.get("video_codec", "unknown")
             a_codec = media_info.get("audio_codec", "unknown")
             output_mp4_name = Path(original_filename).stem + ".mp4"
             local_processed_path = TEMP_DIR / f"proc_{job_id}_{output_mp4_name}"
 
+            last_ffmpeg_ui = 0.0
+            async def ffmpeg_progress_cb(pct: int, out_time_sec: float, speed_str: str, fps_str: str, total_duration: float, mode: str):
+                nonlocal last_ffmpeg_ui
+                now = time.time()
+                if now - last_ffmpeg_ui < 1.5:
+                    return
+                last_ffmpeg_ui = now
+
+                stage_name = "Transcoding" if mode == "transcode_h264" else "Remuxing"
+                status_key = "TRANSCODING" if mode == "transcode_h264" else "REMUXING"
+                filled = int(round(10 * pct / 100))
+                bar = "█" * filled + "░" * (10 - filled)
+                def fmt_sec(s: float) -> str:
+                    if not s or s <= 0:
+                        return "00:00:00"
+                    m, sec = divmod(int(s), 60)
+                    h, m = divmod(m, 60)
+                    return f"{h:02d}:{m:02d}:{sec:02d}"
+
+                time_str = f"{fmt_sec(out_time_sec)} / {fmt_sec(total_duration)}" if total_duration > 0 else fmt_sec(out_time_sec)
+                update_job(job_id, {"status": status_key, "progress_stage": status_key, "progress_percent": pct})
+
+                await notify_ui(
+                    "🎬 *Processing Video*\n\n"
+                    f"📄 *File:* `{original_filename}`\n"
+                    f"⚙️ *{v_codec.upper()} → H.264*\n\n"
+                    f"`[{bar}] {pct}%`\n\n"
+                    f"⏱ *Time:* `{time_str}`\n"
+                    f"🚀 *Speed:* `{speed_str}` | 🎞 *FPS:* `{fps_str}`\n\n"
+                    f"Stage: `{stage_name}`"
+                )
+
             await notify_ui(
                 "🎬 *Processing Video for Browser Playback*\n\n"
                 f"📄 *File:* `{original_filename}`\n"
                 f"🔍 *Codecs:* Video (`{v_codec}`), Audio (`{a_codec}`)\n"
                 f"⚙️ *Target:* MP4 + H.264 + AAC + yuv420p + faststart\n\n"
-                "⏳ *FFmpeg processing in progress...*"
+                "⏳ *FFmpeg processing starting...*"
             )
 
             success, mode, err_desc = await process_video_for_web(
                 local_download_path,
                 local_processed_path,
-                media_info
+                media_info,
+                progress_callback=ffmpeg_progress_cb
             )
 
             if not success:
+                update_job(job_id, {"status": "FAILED", "progress_stage": "FAILED"})
                 raise RuntimeError(f"FFmpeg processing failed ({mode}): {err_desc}")
+
+            update_job(job_id, {"status": "OUTPUT_VALIDATING", "progress_stage": "OUTPUT_VALIDATING"})
+            await notify_ui(
+                "🎬 *Validating Processed Video*\n\n"
+                f"📄 *File:* `{output_mp4_name}`\n\n"
+                "🔍 *Verifying H.264 MP4 output integrity...*"
+            )
 
             upload_path = local_processed_path
             final_size = local_processed_path.stat().st_size
@@ -1081,6 +1264,9 @@ async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]
             proc_mode = "passthrough"
             processed_filename = original_filename
             mime_type = job.get("mime_type", "application/octet-stream")
+
+        proc_dur = round(time.time() - t_proc_start, 2)
+        logger.info(f"[PERF] Job {job_id} | Remux/Transcode ({proc_mode}): {proc_dur} s")
 
         # 5. Save intermediate state and prompt rename
         update_job(job_id, {
@@ -1240,6 +1426,7 @@ async def execute_b2_upload_and_indexing(job_id: str, ptb_app: Optional[Applicat
 
     b2_result = None
     b2_err = ""
+    t_up_start = time.time()
     try:
         async with UPLOAD_SEMAPHORE:
             b2_result = await asyncio.to_thread(
@@ -1263,6 +1450,11 @@ async def execute_b2_upload_and_indexing(job_id: str, ptb_app: Optional[Applicat
         cleanup_job_temp_files(job_id, job['original_filename'])
         return
 
+    up_dur = round(time.time() - t_up_start, 2)
+    up_size = upload_path.stat().st_size
+    up_mbps = round((up_size / (1024 * 1024)) / up_dur, 2) if up_dur > 0 else 0.0
+    logger.info(f"[PERF] Job {job_id} | B2 upload: {up_mbps} MB/s ({up_dur} s)")
+
     # Verify B2
     update_job(job_id, {"status": "VERIFYING", "progress_stage": "VERIFYING"})
     verified = await asyncio.to_thread(b2_storage.file_exists, b2_path)
@@ -1278,6 +1470,7 @@ async def execute_b2_upload_and_indexing(job_id: str, ptb_app: Optional[Applicat
         return
 
     # Database Indexing
+    t_db_start = time.time()
     update_job(job_id, {"status": "DATABASE_INDEXING", "progress_stage": "DATABASE_INDEXING"})
     rec_data = {
         "file_name": filename,
@@ -1300,6 +1493,8 @@ async def execute_b2_upload_and_indexing(job_id: str, ptb_app: Optional[Applicat
     }
 
     db_rec_id = insert_file_record(rec_data)
+    db_ms = int((time.time() - t_db_start) * 1000)
+    logger.info(f"[PERF] Job {job_id} | DB write: {db_ms} ms")
     update_job(job_id, {
         "status": "SUCCESS",
         "progress_stage": "SUCCESS",

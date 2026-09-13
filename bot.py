@@ -1613,6 +1613,21 @@ def cleanup_temp_files(pending: Dict[str, Any]):
         except Exception:
             pass
 
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global exception handler for Telegram bot application updates."""
+    err = context.error
+    if isinstance(err, telegram.error.Conflict):
+        logger.warning(
+            "Telegram getUpdates Conflict: Another bot instance is currently active with this BOT_TOKEN. "
+            "If deploying on Render / cloud, the previous container instance will terminate shortly and polling will resume automatically."
+        )
+    elif isinstance(err, telegram.error.NetworkError):
+        logger.warning(f"Telegram Network Error encountered: {err}. Retrying automatically...")
+    elif isinstance(err, telegram.error.TimedOut):
+        logger.warning(f"Telegram Request Timed Out: {err}. Retrying automatically...")
+    else:
+        logger.error(f"Unhandled exception in Telegram bot update loop: {err}", exc_info=err)
+
 # ============================================================
 # 10. MAIN ENTRY POINT & APPLICATION INITIALIZATION
 # ============================================================
@@ -1655,6 +1670,9 @@ def main():
         .build()
     )
 
+    # Register Global Error Handler
+    app.add_error_handler(global_error_handler)
+
     # Command Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
@@ -1677,7 +1695,7 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_incoming_message))
 
     logger.info("Bot polling initiated...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()

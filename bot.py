@@ -314,8 +314,9 @@ class B2StorageEngine:
             return False, "B2 credentials missing in environment variables."
         try:
             bucket = self._get_bucket()
-            # Perform real list check (fetch 1 item)
-            list(bucket.list_file_names(fetch_count=1))
+            # Perform real list check using bucket.ls()
+            generator = bucket.ls(fetch_count=1)
+            next(generator, None)
             return True, f"B2 Bucket '{self.bucket_name}' authenticated & verified."
         except Exception as e:
             return False, f"B2 Health Check Error: {e}"
@@ -326,7 +327,7 @@ class B2StorageEngine:
             bucket = self._get_bucket()
             folders_set: Set[str] = set()
 
-            for file_version, _ in bucket.list_file_names():
+            for file_version, _ in bucket.ls(recursive=True):
                 name = file_version.file_name
                 if "/" in name:
                     parts = name.split("/")
@@ -348,7 +349,7 @@ class B2StorageEngine:
             prefix = folder_prefix.strip("/") + "/" if folder_prefix and folder_prefix != "/" else ""
             results = []
 
-            for file_version, _ in bucket.list_file_names(prefix=prefix):
+            for file_version, _ in bucket.ls(folder_to_list=prefix, recursive=True):
                 file_name = file_version.file_name
                 if prefix and not file_name.startswith(prefix):
                     continue
@@ -362,7 +363,7 @@ class B2StorageEngine:
                     "b2_path": file_name,
                     "file_name": Path(file_name).name,
                     "file_size": file_version.size,
-                    "upload_timestamp": file_version.upload_timestamp,
+                    "upload_timestamp": getattr(file_version, "upload_timestamp", 0),
                     "b2_url": url
                 })
 
@@ -375,7 +376,15 @@ class B2StorageEngine:
         """Verifies whether an object key exists in B2."""
         try:
             bucket = self._get_bucket()
-            info = bucket.get_file_info_by_name(b2_path)
+            if hasattr(bucket, "get_file_info_by_name"):
+                info = bucket.get_file_info_by_name(b2_path)
+            elif self._b2_api and hasattr(self._b2_api, "get_file_info_by_name"):
+                info = self._b2_api.get_file_info_by_name(self.bucket_name, b2_path)
+            else:
+                for file_version, _ in bucket.ls(folder_to_list=b2_path, recursive=False):
+                    if file_version.file_name == b2_path:
+                        return True
+                return False
             return info is not None
         except Exception:
             return False
@@ -412,7 +421,7 @@ class B2StorageEngine:
             q_lower = query.lower()
             results = []
 
-            for file_version, _ in bucket.list_file_names():
+            for file_version, _ in bucket.ls(recursive=True):
                 if q_lower in file_version.file_name.lower():
                     url = f"{self.public_base_url}/{file_version.file_name}" if self.public_base_url else None
                     results.append({

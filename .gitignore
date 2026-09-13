@@ -1,0 +1,21 @@
+# Python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment & Secrets
+.env
+*.session
+*.session-journal
+
+# Database & Downloads
+storage.db
+storage.db-journal
+downloads/
+temp/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store

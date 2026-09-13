@@ -1,11 +1,8 @@
 """
 Production-Ready Telegram File-Storage & Backblaze B2 Media Processing Bot
-Single-File Architecture: bot.py
+Architecture: Dual-Mode Engine (Render Web Service Bot + MTProto Worker)
 
-Workflow:
-User sends file -> Bot detects file -> Discover REAL B2 folders -> User selects/creates folder
--> Download Telegram file -> FFprobe inspection -> Remux/Transcode video to web-compatible MP4
--> Rename prompt -> B2 duplicate check -> B2 Upload -> B2 Verification -> Save DB Metadata -> Success
+Supports Telegram Files up to 4 GiB (4,294,967,296 bytes) using MTProto.
 """
 
 import os
@@ -17,6 +14,7 @@ import logging
 import asyncio
 import sqlite3
 import shutil
+import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Set, Tuple
@@ -37,13 +35,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger("B2MediaStorageBot")
 
+# Optional Telethon import for MTProto large file downloading
+try:
+    import telethon
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    TELETHON_AVAILABLE = True
+except ImportError:
+    TELETHON_AVAILABLE = False
+    logger.warning("Telethon library is not installed. MTProto large file downloading will be unavailable.")
+
 # ============================================================
 # 1. CONFIGURATION & ENVIRONMENT VARIABLES
 # ============================================================
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "8769661029:AAED5_SSFoU-Q_xQ_-p-x5FqzU7J9MZcIaE").strip()
-ADMIN_IDS_RAW = (os.getenv("ADMIN_IDS") or "5192451273").strip()
+API_ID_RAW = (os.getenv("API_ID") or "").strip()
+API_HASH = (os.getenv("API_HASH") or "").strip()
+TELEGRAM_SESSION_STRING = (os.getenv("TELEGRAM_SESSION_STRING") or "").strip()
 
+API_ID: Optional[int] = None
+if API_ID_RAW and API_ID_RAW.isdigit():
+    API_ID = int(API_ID_RAW)
+
+SERVICE_MODE = (os.getenv("SERVICE_MODE") or "all").strip().lower()  # 'render', 'worker', or 'all'
+
+ADMIN_IDS_RAW = (os.getenv("ADMIN_IDS") or "5192451273").strip()
 ADMIN_IDS: Set[int] = set()
 if ADMIN_IDS_RAW:
     for item in ADMIN_IDS_RAW.split(","):
@@ -66,7 +83,7 @@ DB_PATH = os.getenv("DATABASE_PATH", "./storage.db")
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "./downloads"))
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 4 * 1024 * 1024 * 1024))  # 4 GiB = 4,294,967,296 bytes
+MAX_FILE_SIZE_BYTES = int(os.getenv("MAX_FILE_SIZE_BYTES") or os.getenv("MAX_FILE_SIZE") or (4 * 1024 * 1024 * 1024))  # 4 GiB = 4,294,967,296 bytes
 MAX_CONCURRENT_UPLOADS = int(os.getenv("MAX_CONCURRENT_UPLOADS", 2))
 MAX_CONCURRENT_FFMPEG = int(os.getenv("MAX_CONCURRENT_FFMPEG", 1))
 PORT = int(os.getenv("PORT", 3000))
@@ -88,6 +105,9 @@ from telegram.ext import (
     filters,
 )
 
+# Global Telethon Client Reference
+telethon_client: Optional[Any] = None
+
 # Optional Supabase Database integration
 supabase_client = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
@@ -99,11 +119,11 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
         logger.warning(f"Supabase connection failed: {e}. Falling back to SQLite.")
 
 # ============================================================
-# 2. DATABASE ENGINE (SQLite & Supabase)
+# 2. DATABASE ENGINE & JOB QUEUE STATE MACHINE
 # ============================================================
 
 def get_sqlite_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -140,6 +160,42 @@ def init_db():
     """)
 
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            status_message_id INTEGER,
+            tg_file_id TEXT,
+            tg_file_unique_id TEXT,
+            original_filename TEXT NOT NULL,
+            final_filename TEXT,
+            folder TEXT NOT NULL,
+            source_file_size INTEGER NOT NULL,
+            final_file_size INTEGER,
+            mime_type TEXT,
+            media_type TEXT,
+            video_codec TEXT,
+            audio_codec TEXT,
+            width INTEGER,
+            height INTEGER,
+            duration REAL,
+            processing_mode TEXT,
+            b2_bucket TEXT,
+            b2_path TEXT,
+            b2_file_id TEXT,
+            b2_url TEXT,
+            status TEXT NOT NULL DEFAULT 'QUEUED',
+            progress_percent INTEGER DEFAULT 0,
+            progress_stage TEXT DEFAULT 'QUEUED',
+            error_stage TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             admin_id INTEGER NOT NULL,
@@ -149,13 +205,96 @@ def init_db():
         )
     """)
 
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_folder ON file_records(folder)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_b2_path ON file_records(b2_path)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON file_records(created_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_folder ON file_records(folder)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_b2_path ON file_records(b2_path)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id)")
 
     conn.commit()
     conn.close()
-    logger.info("SQLite database initialized successfully")
+    logger.info("SQLite database & job queue schema initialized successfully.")
+
+def create_job(job_data: Dict[str, Any]) -> str:
+    job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    now_str = datetime.utcnow().isoformat()
+
+    conn = get_sqlite_conn()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO jobs (
+            job_id, user_id, chat_id, message_id, status_message_id,
+            tg_file_id, tg_file_unique_id, original_filename, final_filename,
+            folder, source_file_size, mime_type, media_type, b2_bucket,
+            status, progress_percent, progress_stage, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        job_id,
+        job_data["user_id"],
+        job_data["chat_id"],
+        job_data["message_id"],
+        job_data.get("status_message_id"),
+        job_data.get("tg_file_id", "N/A"),
+        job_data.get("tg_file_unique_id", "N/A"),
+        job_data["original_filename"],
+        job_data.get("final_filename", job_data["original_filename"]),
+        job_data["folder"],
+        job_data["source_file_size"],
+        job_data.get("mime_type", "application/octet-stream"),
+        job_data.get("media_type", "document"),
+        B2_BUCKET_NAME,
+        job_data.get("status", "QUEUED"),
+        0,
+        "QUEUED",
+        now_str,
+        now_str
+    ))
+    conn.commit()
+    conn.close()
+    logger.info(f"Created job record: {job_id} for file {job_data['original_filename']}")
+    return job_id
+
+def update_job(job_id: str, updates: Dict[str, Any]):
+    now_str = datetime.utcnow().isoformat()
+    updates["updated_at"] = now_str
+
+    conn = get_sqlite_conn()
+    cursor = conn.cursor()
+
+    set_clauses = []
+    params = []
+    for k, v in updates.items():
+        set_clauses.append(f"{k} = ?")
+        params.append(v)
+
+    params.append(job_id)
+    query = f"UPDATE jobs SET {', '.join(set_clauses)} WHERE job_id = ?"
+    cursor.execute(query, tuple(params))
+    conn.commit()
+    conn.close()
+
+def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_sqlite_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_next_queued_job() -> Optional[Dict[str, Any]]:
+    conn = get_sqlite_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM jobs WHERE status = 'QUEUED' ORDER BY created_at ASC LIMIT 1")
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_recent_jobs(limit: int = 10) -> List[Dict[str, Any]]:
+    conn = get_sqlite_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 def log_audit(admin_id: int, action: str, details: str):
     try:
@@ -190,18 +329,11 @@ def get_db_stats() -> Dict[str, Any]:
 
     conn.close()
 
-    if total_bytes < 1024 * 1024:
-        readable = f"{total_bytes / 1024:.1f} KB"
-    elif total_bytes < 1024 * 1024 * 1024:
-        readable = f"{total_bytes / (1024 * 1024):.1f} MB"
-    else:
-        readable = f"{total_bytes / (1024 * 1024 * 1024):.2f} GB"
-
     return {
         "total_files": total_files,
         "total_folders": total_folders,
         "total_bytes": total_bytes,
-        "readable_bytes": readable
+        "readable_bytes": format_size(total_bytes)
     }
 
 def insert_file_record(record: Dict[str, Any]) -> Optional[int]:
@@ -310,12 +442,10 @@ class B2StorageEngine:
                 raise
 
     def check_health(self) -> Tuple[bool, str]:
-        """Performs a real authorization & bucket listing check against B2 API."""
         if not self.is_configured():
             return False, "B2 credentials missing in environment variables."
         try:
             bucket = self._get_bucket()
-            # Perform real list check using bucket.ls()
             generator = bucket.ls(fetch_count=1)
             next(generator, None)
             return True, f"B2 Bucket '{self.bucket_name}' authenticated & verified."
@@ -323,7 +453,6 @@ class B2StorageEngine:
             return False, f"B2 Health Check Error: {e}"
 
     def discover_folders(self) -> List[str]:
-        """Discovers real folder prefixes by reading actual object keys from Backblaze B2."""
         try:
             bucket = self._get_bucket()
             folders_set: Set[str] = set()
@@ -343,38 +472,7 @@ class B2StorageEngine:
             logger.error(f"Error discovering real B2 folders: {e}")
             return []
 
-    def list_files_in_folder(self, folder_prefix: str = "") -> List[Dict[str, Any]]:
-        """Lists actual B2 objects matching prefix."""
-        try:
-            bucket = self._get_bucket()
-            prefix = folder_prefix.strip("/") + "/" if folder_prefix and folder_prefix != "/" else ""
-            results = []
-
-            for file_version, _ in bucket.ls(folder_to_list=prefix, recursive=True):
-                file_name = file_version.file_name
-                if prefix and not file_name.startswith(prefix):
-                    continue
-                rel = file_name[len(prefix):]
-                if "/" in rel and rel.endswith("/"):
-                    continue
-
-                url = f"{self.public_base_url}/{file_name}" if self.public_base_url else None
-                results.append({
-                    "b2_file_id": file_version.id_,
-                    "b2_path": file_name,
-                    "file_name": Path(file_name).name,
-                    "file_size": file_version.size,
-                    "upload_timestamp": getattr(file_version, "upload_timestamp", 0),
-                    "b2_url": url
-                })
-
-            return results
-        except Exception as e:
-            logger.error(f"Error listing files in B2 prefix '{folder_prefix}': {e}")
-            return []
-
     def file_exists(self, b2_path: str) -> bool:
-        """Verifies whether an object key exists in B2."""
         try:
             bucket = self._get_bucket()
             if hasattr(bucket, "get_file_info_by_name"):
@@ -391,14 +489,13 @@ class B2StorageEngine:
             return False
 
     def upload_file(self, local_file_path: Path, b2_path: str) -> Dict[str, Any]:
-        """Uploads a local disk file to Backblaze B2 using b2sdk upload_local_file."""
         bucket = self._get_bucket()
         str_path = str(local_file_path)
 
         if not local_file_path.exists():
             raise FileNotFoundError(f"Local file not found for upload: {str_path}")
 
-        logger.info(f"Uploading file to B2: {str_path} -> {b2_path}")
+        logger.info(f"Uploading file to B2: {str_path} -> {b2_path} ({format_size(local_file_path.stat().st_size)})")
 
         file_version = bucket.upload_local_file(
             local_file=str_path,
@@ -450,7 +547,6 @@ def check_ffmpeg_installed() -> Tuple[bool, bool]:
     return ffmpeg_bin, ffprobe_bin
 
 async def probe_media(file_path: Path) -> Dict[str, Any]:
-    """Runs ffprobe on disk file and returns format/stream metadata."""
     ffmpeg_ok, ffprobe_ok = check_ffmpeg_installed()
     if not ffprobe_ok:
         raise RuntimeError("FFprobe binary is not installed on system.")
@@ -519,13 +615,6 @@ async def process_video_for_web(
     output_path: Path,
     media_info: Dict[str, Any]
 ) -> Tuple[bool, str, str]:
-    """
-    Processes input video for progressive browser playback.
-    Determines Remux (Fast Path) vs Transcode path:
-    - Remux: If video codec is already h264/avc1 and pix_fmt is yuv420p.
-    - Transcode: If video codec is hevc/h265, vp9, av1, etc.
-    Always uses -movflags +faststart for web playback.
-    """
     ffmpeg_ok, _ = check_ffmpeg_installed()
     if not ffmpeg_ok:
         raise RuntimeError("FFmpeg binary is not installed on system.")
@@ -534,14 +623,12 @@ async def process_video_for_web(
     a_codec = (media_info.get("audio_codec") or "").lower()
     pix_fmt = (media_info.get("pix_fmt") or "").lower()
 
-    # Fast Path criteria: H.264 video + standard yuv420p pixel format
     is_h264_compatible = v_codec in ["h264", "avc1"] and pix_fmt in ["yuv420p", "yuvj420p", ""]
     is_aac_compatible = a_codec in ["aac"]
 
     async with FFMPEG_SEMAPHORE:
         if is_h264_compatible:
             mode = "remux_fastpath"
-            # Remux video stream without re-encoding
             cmd = [
                 "ffmpeg", "-y",
                 "-i", str(input_path),
@@ -553,7 +640,6 @@ async def process_video_for_web(
             cmd.extend(["-movflags", "+faststart", str(output_path)])
         else:
             mode = "transcode_h264"
-            # Transcode video into H.264 + AAC + yuv420p + faststart
             cmd = [
                 "ffmpeg", "-y",
                 "-i", str(input_path),
@@ -588,7 +674,539 @@ async def process_video_for_web(
         return True, mode, "Success"
 
 # ============================================================
-# 5. HELPER UTILITIES & SECURITY
+# 5. MTPROTO TELETHON CLIENT & DOWNLOAD ENGINE
+# ============================================================
+
+async def get_telethon_client() -> Optional[Any]:
+    global telethon_client
+    if not TELETHON_AVAILABLE:
+        return None
+
+    if telethon_client and telethon_client.is_connected():
+        return telethon_client
+
+    if not API_ID or not API_HASH:
+        logger.warning("MTProto API_ID or API_HASH is missing. Telethon MTProto client cannot start.")
+        return None
+
+    try:
+        if TELEGRAM_SESSION_STRING:
+            logger.info("Initializing Telethon client with TELEGRAM_SESSION_STRING...")
+            session = StringSession(TELEGRAM_SESSION_STRING)
+            telethon_client = TelegramClient(session, API_ID, API_HASH)
+            await telethon_client.connect()
+            if not await telethon_client.is_user_authorized():
+                logger.error("TELEGRAM_SESSION_STRING is invalid or not authorized.")
+                return None
+        else:
+            logger.info("Initializing Telethon client with Bot Token...")
+            session = StringSession()
+            telethon_client = TelegramClient(session, API_ID, API_HASH)
+            await telethon_client.start(bot_token=BOT_TOKEN)
+
+        logger.info("Telethon MTProto client initialized & connected successfully!")
+        return telethon_client
+    except Exception as e:
+        logger.error(f"Failed to initialize Telethon MTProto client: {e}")
+        return None
+
+async def download_telegram_file_mtproto(
+    chat_id: int,
+    message_id: int,
+    output_path: Path,
+    progress_callback=None
+) -> bool:
+    client = await get_telethon_client()
+    if not client:
+        raise RuntimeError("MTProto client is not configured or unavailable. Set API_ID and API_HASH.")
+
+    msg = await client.get_messages(chat_id, ids=message_id)
+    if not msg or not msg.media:
+        raise RuntimeError(f"Telegram message {message_id} in chat {chat_id} not found or contains no media via MTProto.")
+
+    last_progress_time = [0.0]
+
+    def raw_progress_cb(current: int, total: int):
+        now = time.time()
+        if now - last_progress_time[0] >= 3.0 or current == total:
+            last_progress_time[0] = now
+            if progress_callback:
+                asyncio.run_coroutine_threadsafe(
+                    progress_callback(current, total),
+                    loop=asyncio.get_event_loop()
+                )
+
+    await client.download_media(
+        msg,
+        file=str(output_path),
+        progress_callback=raw_progress_cb if progress_callback else None
+    )
+
+    return output_path.exists() and output_path.stat().st_size > 0
+
+async def setup_telethon_session_cli():
+    """Interactive setup for generating TELEGRAM_SESSION_STRING."""
+    if not TELETHON_AVAILABLE:
+        print("Error: Telethon package is required. Run 'pip install telethon'.")
+        return
+
+    print("=== Telegram MTProto StringSession Setup ===")
+    api_id_inp = input("Enter API_ID: ").strip()
+    api_hash_inp = input("Enter API_HASH: ").strip()
+
+    if not api_id_inp or not api_hash_inp:
+        print("API_ID and API_HASH are required.")
+        return
+
+    client = TelegramClient(StringSession(), int(api_id_inp), api_hash_inp)
+    await client.start()
+    string_session = client.session.save()
+    print("\n=======================================================")
+    print("SUCCESS! Your TELEGRAM_SESSION_STRING is:")
+    print(string_session)
+    print("=======================================================")
+    print("Save this in your .env or Render Environment Variables as TELEGRAM_SESSION_STRING.")
+    await client.disconnect()
+
+# ============================================================
+# 6. VPS MTPROTO WORKER ENGINE (ASYNC JOB PROCESSOR)
+# ============================================================
+
+worker_running = False
+worker_lock = asyncio.Lock()
+
+async def run_worker_loop(ptb_app: Optional[Application] = None):
+    global worker_running
+    worker_running = True
+    logger.info("MTProto Worker Loop started...")
+
+    while worker_running:
+        try:
+            job = get_next_queued_job()
+            if not job:
+                await asyncio.sleep(2.0)
+                continue
+
+            async with worker_lock:
+                await process_single_job(job, ptb_app)
+
+        except asyncio.CancelledError:
+            logger.info("Worker loop cancelled.")
+            break
+        except Exception as e:
+            logger.error(f"Error in MTProto worker loop: {e}", exc_info=e)
+            await asyncio.sleep(3.0)
+
+async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]):
+    job_id = job["job_id"]
+    chat_id = job["chat_id"]
+    message_id = job["message_id"]
+    status_msg_id = job.get("status_message_id")
+    original_filename = job["original_filename"]
+    file_size = job["source_file_size"]
+    folder = job["folder"]
+
+    logger.info(f"Worker picking up job {job_id} for file '{original_filename}' ({format_size(file_size)})")
+    update_job(job_id, {"status": "DOWNLOADING", "progress_stage": "DOWNLOADING", "progress_percent": 0})
+
+    bot_client = ptb_app.bot if ptb_app else None
+
+    async def notify_ui(text: str, reply_markup=None):
+        if not bot_client or not status_msg_id:
+            return
+        try:
+            await bot_client.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_msg_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.debug(f"UI notification edit exception: {e}")
+
+    await notify_ui(
+        "🎬 *Processing Workflow Started*\n\n"
+        f"📄 *Original File:* `{original_filename}` ({format_size(file_size)})\n"
+        f"📁 *B2 Target Folder:* `{folder}`\n\n"
+        "⬇️ *Downloading Telegram file via MTProto...*"
+    )
+
+    # 1. Disk Space Check
+    required_bytes = int(file_size * 2.2)
+    space_ok, space_msg = check_disk_space(required_bytes)
+    if not space_ok:
+        err_text = (
+            f"❌ *STORAGE FAILED*\n\n"
+            f"📄 *File:* `{original_filename}`\n"
+            f"📁 *Folder:* `{folder}`\n"
+            f"⬇️ Download: ❌ Insufficient Disk Space\n\n"
+            f"*Reason:* {space_msg}"
+        )
+        update_job(job_id, {"status": "FAILED", "error_stage": "DOWNLOADING", "error_message": space_msg})
+        await notify_ui(err_text)
+        return
+
+    local_download_path = TEMP_DIR / f"down_{job_id}_{original_filename}"
+    local_processed_path = None
+
+    try:
+        # 2. MTProto Download
+        if API_ID and API_HASH and TELETHON_AVAILABLE:
+            async def download_cb(current: int, total: int):
+                pct = int((current / total) * 100) if total else 0
+                update_job(job_id, {"progress_percent": pct})
+                await notify_ui(
+                    "⬇️ *Downloading Telegram file via MTProto...*\n\n"
+                    f"📄 *File:* `{original_filename}`\n"
+                    f"📊 *Progress:* `{pct}%` (`{format_size(current)}` / `{format_size(total)}`)"
+                )
+
+            download_ok = await download_telegram_file_mtproto(
+                chat_id=chat_id,
+                message_id=message_id,
+                output_path=local_download_path,
+                progress_callback=download_cb
+            )
+
+            if not download_ok:
+                raise RuntimeError("MTProto download returned 0 bytes or file missing on disk.")
+
+        else:
+            # Fallback for small files <= 20 MB via Bot API if MTProto is unconfigured
+            if file_size > 20 * 1024 * 1024:
+                raise RuntimeError(
+                    f"Telegram Bot API Download Limit Exceeded.\n"
+                    f"File size: {format_size(file_size)} (Exceeds 20 MiB Bot API limit).\n"
+                    f"To process files up to 4 GiB, configure API_ID and API_HASH for MTProto."
+                )
+
+            if not bot_client:
+                raise RuntimeError("Bot client unavailable for fallback download.")
+
+            tg_file = await bot_client.get_file(job["tg_file_id"])
+            await tg_file.download_to_drive(custom_path=local_download_path)
+
+        # 3. FFprobe Inspection
+        update_job(job_id, {"status": "INSPECTING", "progress_stage": "INSPECTING"})
+        await notify_ui(
+            "🎬 *Inspecting Media Properties*\n\n"
+            f"📄 *File:* `{original_filename}`\n\n"
+            "🔍 *Running FFprobe analysis...*"
+        )
+
+        media_info = {}
+        is_video = False
+        try:
+            media_info = await probe_media(local_download_path)
+            is_video = media_info.get("is_video", False)
+        except Exception as e:
+            logger.warning(f"FFprobe note for job {job_id}: {e}")
+
+        # 4. Processing (Remux / Transcode vs Passthrough)
+        if is_video:
+            v_codec = media_info.get("video_codec", "unknown")
+            a_codec = media_info.get("audio_codec", "unknown")
+            output_mp4_name = Path(original_filename).stem + ".mp4"
+            local_processed_path = TEMP_DIR / f"proc_{job_id}_{output_mp4_name}"
+
+            await notify_ui(
+                "🎬 *Processing Video for Browser Playback*\n\n"
+                f"📄 *File:* `{original_filename}`\n"
+                f"🔍 *Codecs:* Video (`{v_codec}`), Audio (`{a_codec}`)\n"
+                f"⚙️ *Target:* MP4 + H.264 + AAC + yuv420p + faststart\n\n"
+                "⏳ *FFmpeg processing in progress...*"
+            )
+
+            success, mode, err_desc = await process_video_for_web(
+                local_download_path,
+                local_processed_path,
+                media_info
+            )
+
+            if not success:
+                raise RuntimeError(f"FFmpeg processing failed ({mode}): {err_desc}")
+
+            upload_path = local_processed_path
+            final_size = local_processed_path.stat().st_size
+            proc_mode = mode
+            processed_filename = output_mp4_name
+            mime_type = "video/mp4"
+        else:
+            upload_path = local_download_path
+            final_size = local_download_path.stat().st_size
+            proc_mode = "passthrough"
+            processed_filename = original_filename
+            mime_type = job.get("mime_type", "application/octet-stream")
+
+        # 5. Save intermediate state and prompt rename
+        update_job(job_id, {
+            "status": "WAITING_FOR_RENAME",
+            "progress_stage": "WAITING_FOR_RENAME",
+            "processing_mode": proc_mode,
+            "final_filename": processed_filename,
+            "final_file_size": final_size,
+            "mime_type": mime_type,
+            "video_codec": media_info.get("video_codec"),
+            "audio_codec": media_info.get("audio_codec"),
+            "width": media_info.get("width"),
+            "height": media_info.get("height"),
+            "duration": media_info.get("duration"),
+        })
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Keep Current Name", callback_data=f"job_rename_no:{job_id}"),
+                InlineKeyboardButton("✏️ Rename File", callback_data=f"job_rename_yes:{job_id}")
+            ],
+            [
+                InlineKeyboardButton("❌ Cancel Job", callback_data=f"job_cancel:{job_id}")
+            ]
+        ])
+
+        await notify_ui(
+            "✏️ *Rename File Before Upload?*\n\n"
+            f"📄 *Processed Name:* `{processed_filename}`\n"
+            f"📁 *B2 Target Folder:* `{folder}`\n"
+            f"⚙️ *Processing Mode:* `{proc_mode}`\n"
+            f"📦 *Processed Size:* `{format_size(final_size)}`",
+            reply_markup=keyboard
+        )
+
+    except Exception as e:
+        logger.error(f"Job {job_id} processing exception: {e}", exc_info=e)
+        update_job(job_id, {"status": "FAILED", "error_stage": "PROCESSING", "error_message": str(e)})
+        await notify_ui(
+            f"❌ *STORAGE FAILED*\n\n"
+            f"📄 *File:* `{original_filename}`\n"
+            f"📁 *Folder:* `{folder}`\n"
+            f"⬇️ Download: ❌ Exception\n\n"
+            f"*Reason:* {e}"
+        )
+        if local_download_path.exists():
+            local_download_path.unlink(missing_ok=True)
+        if local_processed_path and local_processed_path.exists():
+            local_processed_path.unlink(missing_ok=True)
+
+async def continue_job_upload(job_id: str, ptb_app: Optional[Application]):
+    job = get_job(job_id)
+    if not job or job["status"] in ["CANCELLED", "FAILED", "SUCCESS"]:
+        return
+
+    chat_id = job["chat_id"]
+    status_msg_id = job.get("status_message_id")
+    folder = job["folder"]
+    filename = job["final_filename"]
+    proc_mode = job.get("processing_mode", "passthrough")
+
+    bot_client = ptb_app.bot if ptb_app else None
+
+    async def notify_ui(text: str, reply_markup=None):
+        if not bot_client or not status_msg_id:
+            return
+        try:
+            await bot_client.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_msg_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.debug(f"UI notification edit exception: {e}")
+
+    # Construct B2 path
+    clean_filename = sanitize_filename(filename)
+    if folder == "/":
+        b2_path = clean_filename
+    else:
+        b2_path = f"{folder.strip('/')}/{clean_filename}"
+
+    update_job(job_id, {"b2_path": b2_path, "status": "UPLOADING", "progress_stage": "UPLOADING"})
+
+    # Check B2 duplicate
+    exists = await asyncio.to_thread(b2_storage.file_exists, b2_path)
+    if exists:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🔄 Overwrite B2 File", callback_data=f"job_dup_overwrite:{job_id}"),
+                InlineKeyboardButton("✏️ Auto-Rename", callback_data=f"job_dup_autorename:{job_id}")
+            ],
+            [
+                InlineKeyboardButton("❌ Cancel Job", callback_data=f"job_cancel:{job_id}")
+            ]
+        ])
+        await notify_ui(
+            "⚠️ *File Already Exists in B2*\n\n"
+            f"📁 *Folder:* `{folder}`\n"
+            f"📄 *File:* `{clean_filename}`\n"
+            f"🔗 *B2 Path:* `{b2_path}`\n\n"
+            "Please select duplicate resolution action:",
+            reply_markup=keyboard
+        )
+        return
+
+    await execute_b2_upload_and_indexing(job_id, ptb_app)
+
+async def execute_b2_upload_and_indexing(job_id: str, ptb_app: Optional[Application]):
+    job = get_job(job_id)
+    if not job:
+        return
+
+    chat_id = job["chat_id"]
+    status_msg_id = job.get("status_message_id")
+    folder = job["folder"]
+    b2_path = job["b2_path"]
+    filename = job["final_filename"]
+    proc_mode = job.get("processing_mode", "passthrough")
+
+    bot_client = ptb_app.bot if ptb_app else None
+
+    async def notify_ui(text: str, reply_markup=None):
+        if not bot_client or not status_msg_id:
+            return
+        try:
+            await bot_client.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_msg_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+    # Find upload file path on disk
+    local_download_path = TEMP_DIR / f"down_{job_id}_{job['original_filename']}"
+    output_mp4_name = Path(job['original_filename']).stem + ".mp4"
+    local_processed_path = TEMP_DIR / f"proc_{job_id}_{output_mp4_name}"
+
+    upload_path = local_processed_path if local_processed_path.exists() else local_download_path
+    if not upload_path.exists():
+        await notify_ui(f"❌ *STORAGE FAILED*: Local temp file missing on disk for upload.")
+        update_job(job_id, {"status": "FAILED", "error_message": "Local disk file missing"})
+        return
+
+    await notify_ui(
+        "☁️ *Uploading File to Backblaze B2...*\n\n"
+        f"📄 *File:* `{filename}`\n"
+        f"📁 *Folder:* `{folder}`\n"
+        f"🔗 *B2 Path:* `{b2_path}`\n"
+        f"📦 *Size:* `{format_size(upload_path.stat().st_size)}`"
+    )
+
+    b2_result = None
+    b2_err = ""
+    try:
+        async with UPLOAD_SEMAPHORE:
+            b2_result = await asyncio.to_thread(
+                b2_storage.upload_file,
+                upload_path,
+                b2_path
+            )
+    except Exception as e:
+        logger.error(f"B2 upload exception for job {job_id}: {e}")
+        b2_err = str(e)
+
+    if not b2_result:
+        update_job(job_id, {"status": "FAILED", "error_stage": "UPLOADING", "error_message": b2_err})
+        await notify_ui(
+            f"❌ *STORAGE FAILED*\n\n"
+            f"📄 *File:* `{filename}`\n"
+            f"📁 *Folder:* `{folder}`\n"
+            f"☁️ B2 Upload: ❌ Failed\n\n"
+            f"*Reason:* {b2_err}"
+        )
+        cleanup_job_temp_files(job_id, job['original_filename'])
+        return
+
+    # Verify B2
+    update_job(job_id, {"status": "VERIFYING", "progress_stage": "VERIFYING"})
+    verified = await asyncio.to_thread(b2_storage.file_exists, b2_path)
+    if not verified:
+        update_job(job_id, {"status": "FAILED", "error_stage": "VERIFYING", "error_message": "Post-upload verification failed"})
+        await notify_ui(
+            f"❌ *STORAGE FAILED*\n\n"
+            f"📄 *File:* `{filename}`\n"
+            f"📁 *Folder:* `{folder}`\n"
+            f"☁️ B2 Verification: ❌ Object key not found in bucket after upload."
+        )
+        cleanup_job_temp_files(job_id, job['original_filename'])
+        return
+
+    # Database Indexing
+    update_job(job_id, {"status": "DATABASE_INDEXING", "progress_stage": "DATABASE_INDEXING"})
+    rec_data = {
+        "file_name": filename,
+        "original_file_name": job["original_filename"],
+        "folder": folder,
+        "b2_bucket": B2_BUCKET_NAME,
+        "b2_path": b2_path,
+        "b2_file_id": b2_result.get("b2_file_id"),
+        "file_size": b2_result.get("file_size", upload_path.stat().st_size),
+        "mime_type": job.get("mime_type", "application/octet-stream"),
+        "media_type": job.get("media_type", "document"),
+        "video_codec": job.get("video_codec"),
+        "audio_codec": job.get("audio_codec"),
+        "width": job.get("width"),
+        "height": job.get("height"),
+        "duration": job.get("duration"),
+        "processing_mode": proc_mode,
+        "status": "complete",
+        "b2_url": b2_result.get("b2_url")
+    }
+
+    db_rec_id = insert_file_record(rec_data)
+    update_job(job_id, {
+        "status": "SUCCESS",
+        "progress_stage": "SUCCESS",
+        "b2_file_id": b2_result.get("b2_file_id"),
+        "b2_url": b2_result.get("b2_url")
+    })
+
+    if not db_rec_id:
+        await notify_ui(
+            "⚠️ *PARTIAL SUCCESS (DATABASE INDEX FAILED)*\n\n"
+            f"📄 *File:* `{filename}`\n"
+            f"📁 *Folder:* `{folder}`\n"
+            f"☁️ B2: ✅ Uploaded & Verified\n"
+            f"🆔 B2 File ID: `{b2_result.get('b2_file_id')}`\n"
+            f"🗄 Database: ❌ Index row insertion failed"
+        )
+    else:
+        url_text = f"`{b2_result['b2_url']}`" if b2_result.get("b2_url") else "`N/A (Private Bucket)`"
+        await notify_ui(
+            "✅ *STORAGE WORKFLOW SUCCESSFUL*\n\n"
+            f"📄 *File:* `{filename}`\n"
+            f"📁 *Folder:* `{folder}`\n"
+            f"🎬 *Mode:* `{proc_mode}`\n"
+            f"☁️ *B2 Bucket:* `{B2_BUCKET_NAME}`\n"
+            f"🆔 *B2 File ID:* `{b2_result.get('b2_file_id')}`\n"
+            f"🔗 *B2 Path:* `{b2_path}`\n"
+            f"🗄️ *DB Record ID:* `{db_rec_id}`\n"
+            f"🌐 *Public URL:* {url_text}"
+        )
+
+    cleanup_job_temp_files(job_id, job['original_filename'])
+
+def cleanup_job_temp_files(job_id: str, original_filename: str):
+    p_down = TEMP_DIR / f"down_{job_id}_{original_filename}"
+    output_mp4_name = Path(original_filename).stem + ".mp4"
+    p_proc = TEMP_DIR / f"proc_{job_id}_{output_mp4_name}"
+
+    if p_down.exists():
+        try:
+            p_down.unlink(missing_ok=True)
+        except Exception:
+            pass
+    if p_proc.exists():
+        try:
+            p_proc.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+# ============================================================
+# 7. HELPER UTILITIES & SECURITY
 # ============================================================
 
 def is_admin(update: Update) -> bool:
@@ -636,7 +1254,7 @@ def check_disk_space(required_bytes: int) -> Tuple[bool, str]:
         return True, str(e)
 
 # ============================================================
-# 6. HTTP HEALTH CHECK SERVER (PORT 3000)
+# 8. HTTP HEALTH CHECK SERVER (PORT 3000)
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -659,7 +1277,7 @@ def start_health_server():
         logger.warning(f"Could not bind HTTP server on port {PORT}: {e}")
 
 # ============================================================
-# 7. TELEGRAM COMMAND HANDLERS
+# 9. TELEGRAM COMMAND HANDLERS
 # ============================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -673,9 +1291,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🚀 *Production B2 & Telegram Storage Bot*\n\n"
         f"👑 *Admin User:* `{admin_id}`\n"
+        f"⚙️ *Service Mode:* `{SERVICE_MODE}`\n"
+        f"⚡ *MTProto Client:* {'✅ Configured' if (API_ID and API_HASH) else '⚠️ Unconfigured'}\n"
         f"☁️ *B2 Bucket:* `{B2_BUCKET_NAME}`\n"
         f"🔗 *B2 Health:* {'✅ Connected' if b2_ok else '❌ Error'}\n\n"
-        "Send any file or video to begin storage workflow!"
+        "Send any file or video (up to 4 GiB) to begin storage workflow!"
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -688,6 +1308,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔄 Refresh Folders", callback_data="cmd_refresh_folders")
         ],
         [
+            InlineKeyboardButton("📋 Active Jobs Queue", callback_data="cmd_jobs_list"),
             InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")
         ]
     ])
@@ -708,15 +1329,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - Commands Guide\n"
         "/folders - Browse Real B2 Folders\n"
         "/selected - View Active Upload Folder\n"
-        "/files - List files in current folder\n"
         "/search <query> - Search stored B2 objects\n"
         "/stats - View storage usage statistics\n"
         "/storage - Perform real component health checks\n"
+        "/jobs - List recent processing jobs\n"
         "/admin - Admin Security Panel\n"
         "/admins - List authorized Admin IDs\n"
         "/addadmin <id> - Add an admin ID\n"
         "/removeadmin <id> - Remove an admin ID\n"
-        "/broadcast <text> - Broadcast announcement\n"
         "/audit - View admin audit logs\n"
         "/cancel - Reset active interactive state"
     )
@@ -729,13 +1349,9 @@ async def storage_health_command(update: Update, context: ContextTypes.DEFAULT_T
 
     msg = await update.message.reply_text("⏳ *Performing Real System Health Check...*", parse_mode="Markdown") if update.message else None
 
-    # 1. B2 Check
     b2_ok, b2_msg = await asyncio.to_thread(b2_storage.check_health)
-
-    # 2. FFmpeg / FFprobe Check
     ffmpeg_ok, ffprobe_ok = check_ffmpeg_installed()
 
-    # 3. Database Check
     db_ok = True
     db_msg = "Database operational"
     try:
@@ -745,12 +1361,14 @@ async def storage_health_command(update: Update, context: ContextTypes.DEFAULT_T
         db_ok = False
         db_msg = str(e)
 
+    mtproto_ok = bool(API_ID and API_HASH and TELETHON_AVAILABLE)
+
     status_text = (
-        "🗄 *Real Storage Health Status*\n\n"
+        "🗄 *Real System Health Status*\n\n"
+        f"⚙️ *Service Mode:* `{SERVICE_MODE}`\n"
+        f"⚡ *MTProto Client:* {'✅ Available (4 GiB)' if mtproto_ok else '⚠️ Unconfigured'}\n"
         f"☁️ *B2 Authentication:* {'✅' if b2_ok else '❌'}\n"
         f"🪣 *Bucket (`{B2_BUCKET_NAME}`):* {'✅' if b2_ok else '❌'}\n"
-        f"📂 *Listing Capability:* {'✅' if b2_ok else '❌'}\n"
-        f"📤 *Upload Capability:* {'✅' if b2_ok else '❌'}\n"
         f"📄 *B2 Status:* {b2_msg}\n\n"
         f"🎬 *FFmpeg Binary:* {'✅' if ffmpeg_ok else '❌'}\n"
         f"🔍 *FFprobe Binary:* {'✅' if ffprobe_ok else '❌'}\n\n"
@@ -774,7 +1392,6 @@ async def folders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur_folder = context.user_data.get("selected_folder", "/")
 
     buttons = []
-    # Root folder option
     root_icon = "🎯 " if cur_folder == "/" else "📁 "
     buttons.append([InlineKeyboardButton(f"{root_icon}[Root /]", callback_data="folder_sel:/")])
 
@@ -859,13 +1476,39 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await deny_access(update)
+        return
+
+    jobs = get_recent_jobs(10)
+    if not jobs:
+        text = "📋 No processing jobs in queue history."
+    else:
+        lines = ["📋 *Recent Processing Jobs Queue*:\n"]
+        for j in jobs:
+            st = j["status"]
+            icon = "✅" if st == "SUCCESS" else ("❌" if st == "FAILED" else "⏳")
+            lines.append(
+                f"• {icon} `{j['original_filename']}` ({format_size(j['source_file_size'])})\n"
+                f"  Status: *{st}* | Folder: `{j['folder']}` | ID: `{j['job_id']}`"
+            )
+        text = "\n".join(lines)
+
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Main Menu", callback_data="start_menu")]])
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown")
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await deny_access(update)
         return
 
     context.user_data.pop("awaiting_folder_input", None)
-    context.user_data.pop("awaiting_rename_input", None)
+    context.user_data.pop("awaiting_rename_job_id", None)
     context.user_data.pop("pending_file", None)
     await update.message.reply_text("❌ Active prompts and operations cancelled.", parse_mode="Markdown")
 
@@ -884,7 +1527,6 @@ async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         "• `/admins` - View authorized IDs\n"
         "• `/addadmin <id>` - Grant access\n"
         "• `/removeadmin <id>` - Revoke access\n"
-        "• `/broadcast <text>` - Broadcast alert\n"
         "• `/audit` - View action logs"
     )
 
@@ -901,7 +1543,7 @@ async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
     else:
-        await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        await update.message.reply_text(text, parse_mode="Markdown")
 
 async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -970,7 +1612,7 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 # ============================================================
-# 8. CALLBACK QUERY ROUTER
+# 10. CALLBACK QUERY ROUTER
 # ============================================================
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -984,12 +1626,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data == "start_menu":
         await start_command(update, context)
-    elif data == "cmd_folders" or data == "cmd_refresh_folders":
+    elif data in ["cmd_folders", "cmd_refresh_folders"]:
         await folders_command(update, context)
     elif data == "cmd_stats":
         await stats_command(update, context)
     elif data == "cmd_storage_health":
         await storage_health_command(update, context)
+    elif data == "cmd_jobs_list":
+        await jobs_command(update, context)
     elif data == "admin_panel":
         await admin_panel_command(update, context)
     elif data == "admin_list":
@@ -1000,15 +1644,26 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         folder = data.split("folder_sel:", 1)[1]
         context.user_data["selected_folder"] = folder
         
-        # Check if there is a pending file waiting to be processed
         pending = context.user_data.get("pending_file")
         if pending:
-            await execute_storage_pipeline(update, context, folder)
+            pending["folder"] = folder
+            job_id = create_job(pending)
+            context.user_data.pop("pending_file", None)
+
+            await query.edit_message_text(
+                "🎬 *Job Queued Successfully*\n\n"
+                f"📄 *File:* `{pending['original_filename']}` ({format_size(pending['source_file_size'])})\n"
+                f"📁 *B2 Target Folder:* `{folder}`\n"
+                f"🆔 *Job ID:* `{job_id}`\n\n"
+                "⏳ *Queued for MTProto worker processing...*",
+                parse_mode="Markdown"
+            )
         else:
             await query.edit_message_text(
                 f"✅ Active destination folder set to: `{folder}`\n\nNow send any file or video to process and upload to this folder.",
                 parse_mode="Markdown"
             )
+
     elif data == "folder_create":
         context.user_data["awaiting_folder_input"] = True
         await query.edit_message_text(
@@ -1016,30 +1671,46 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "Please send the new folder path (e.g. `Solo Leveling` or `Movies/Action`):",
             parse_mode="Markdown"
         )
-    elif data == "rename_yes":
-        context.user_data["awaiting_rename_input"] = True
+
+    elif data.startswith("job_rename_no:"):
+        job_id = data.split("job_rename_no:", 1)[1]
+        app_ref = context.application
+        asyncio.create_task(continue_job_upload(job_id, app_ref))
+
+    elif data.startswith("job_rename_yes:"):
+        job_id = data.split("job_rename_yes:", 1)[1]
+        context.user_data["awaiting_rename_job_id"] = job_id
         await query.edit_message_text(
             "✏️ *Rename File*\n\n"
             "Please send the desired filename (e.g. `S01E01.mp4` or `Solo Leveling - 01`):",
             parse_mode="Markdown"
         )
-    elif data == "rename_no":
-        await continue_pipeline_after_rename(update, context, rename_to=None)
-    elif data == "dup_overwrite":
-        await continue_pipeline_b2_upload(update, context, overwrite=True)
-    elif data == "dup_rename":
-        context.user_data["awaiting_rename_input"] = True
-        await query.edit_message_text(
-            "✏️ *Rename File to avoid overwrite*\n\n"
-            "Send a unique filename:",
-            parse_mode="Markdown"
-        )
-    elif data == "dup_cancel":
-        context.user_data.pop("pending_file", None)
-        await query.edit_message_text("❌ Storage operation cancelled by user.", parse_mode="Markdown")
+
+    elif data.startswith("job_dup_overwrite:"):
+        job_id = data.split("job_dup_overwrite:", 1)[1]
+        app_ref = context.application
+        asyncio.create_task(execute_b2_upload_and_indexing(job_id, app_ref))
+
+    elif data.startswith("job_dup_autorename:"):
+        job_id = data.split("job_dup_autorename:", 1)[1]
+        job = get_job(job_id)
+        if job:
+            stem = Path(job["final_filename"]).stem
+            ext = Path(job["final_filename"]).suffix
+            new_fn = f"{stem}_{int(time.time())}{ext}"
+            folder = job["folder"]
+            new_b2_path = new_fn if folder == "/" else f"{folder.strip('/')}/{new_fn}"
+            update_job(job_id, {"final_filename": new_fn, "b2_path": new_b2_path})
+            app_ref = context.application
+            asyncio.create_task(execute_b2_upload_and_indexing(job_id, app_ref))
+
+    elif data.startswith("job_cancel:"):
+        job_id = data.split("job_cancel:", 1)[1]
+        update_job(job_id, {"status": "CANCELLED"})
+        await query.edit_message_text(f"❌ Job `{job_id}` cancelled by user.", parse_mode="Markdown")
 
 # ============================================================
-# 9. MAIN INTERACTIVE STORAGE & MEDIA PIPELINE
+# 11. INCOMING MESSAGE HANDLER (FILES & TEXT INPUTS)
 # ============================================================
 
 async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1051,7 +1722,7 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
     if not msg:
         return
 
-    # Handle text inputs for active prompts
+    # Handle text inputs for folder creation or file renaming
     if context.user_data.get("awaiting_folder_input"):
         folder_raw = msg.text.strip().strip("/")
         context.user_data.pop("awaiting_folder_input", None)
@@ -1061,20 +1732,39 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
             
             pending = context.user_data.get("pending_file")
             if pending:
-                await execute_storage_pipeline(update, context, folder)
+                pending["folder"] = folder
+                job_id = create_job(pending)
+                context.user_data.pop("pending_file", None)
+                await msg.reply_text(
+                    "🎬 *Job Queued Successfully*\n\n"
+                    f"📄 *File:* `{pending['original_filename']}` ({format_size(pending['source_file_size'])})\n"
+                    f"📁 *B2 Target Folder:* `{folder}`\n"
+                    f"🆔 *Job ID:* `{job_id}`\n\n"
+                    "⏳ *Queued for MTProto worker processing...*",
+                    parse_mode="Markdown"
+                )
             else:
                 await msg.reply_text(f"✅ Active B2 destination folder created & set to: `{folder}`", parse_mode="Markdown")
         else:
             await msg.reply_text("❌ Invalid folder path.")
         return
 
-    if context.user_data.get("awaiting_rename_input"):
+    if context.user_data.get("awaiting_rename_job_id"):
+        job_id = context.user_data.pop("awaiting_rename_job_id")
         new_filename = msg.text.strip()
-        context.user_data.pop("awaiting_rename_input", None)
-        await continue_pipeline_after_rename(update, context, rename_to=new_filename)
+        clean_fn = sanitize_filename(new_filename)
+        job = get_job(job_id)
+        if job:
+            if job.get("media_type") == "video" and not clean_fn.lower().endswith(".mp4"):
+                clean_fn += ".mp4"
+            folder = job["folder"]
+            b2_path = clean_fn if folder == "/" else f"{folder.strip('/')}/{clean_fn}"
+            update_job(job_id, {"final_filename": clean_fn, "b2_path": b2_path})
+            app_ref = context.application
+            asyncio.create_task(continue_job_upload(job_id, app_ref))
         return
 
-    # Handle file/media upload trigger
+    # Handle incoming document/video file uploads
     file_obj = msg.document or msg.video or msg.audio or (msg.photo[-1] if msg.photo else None)
     if not file_obj:
         return
@@ -1087,7 +1777,6 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
     file_id = getattr(file_obj, "file_id", "N/A")
     file_unique_id = getattr(file_obj, "file_unique_id", "N/A")
 
-    # Log real Telegram file metadata
     logger.info(
         f"Incoming Telegram File Metadata:\n"
         f"  file_id: {file_id}\n"
@@ -1095,35 +1784,41 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         f"  file_size: {file_size} bytes ({format_size(file_size)})\n"
         f"  filename: {original_name}\n"
         f"  MIME type: {mime_type}\n"
-        f"  Application limit: {MAX_FILE_SIZE} bytes ({format_size(MAX_FILE_SIZE)})"
+        f"  Application limit: {MAX_FILE_SIZE_BYTES} bytes ({format_size(MAX_FILE_SIZE_BYTES)})"
     )
 
-    if file_size and file_size > MAX_FILE_SIZE:
+    if file_size and file_size > MAX_FILE_SIZE_BYTES:
         await msg.reply_text(
             f"❌ *Application Size Limit Exceeded*\n\n"
             f"• *File:* `{original_name}`\n"
             f"• *File Size:* `{file_size}` bytes ({format_size(file_size)})\n"
-            f"• *Application Limit:* `{MAX_FILE_SIZE}` bytes ({format_size(MAX_FILE_SIZE)})\n\n"
+            f"• *Application Limit:* `{MAX_FILE_SIZE_BYTES}` bytes ({format_size(MAX_FILE_SIZE_BYTES)})\n\n"
             f"The application maximum is 4 GiB (4,294,967,296 bytes).",
             parse_mode="Markdown"
         )
         return
 
-    # Save pending file context
-    context.user_data["pending_file"] = {
+    cur_folder = context.user_data.get("selected_folder", "/")
+    pending_data = {
+        "user_id": msg.from_user.id if msg.from_user else 0,
+        "chat_id": msg.chat_id,
+        "message_id": msg.message_id,
+        "status_message_id": None,
         "tg_file_id": file_id,
         "tg_file_unique_id": file_unique_id,
-        "original_file_name": original_name,
-        "file_size": file_size,
+        "original_filename": original_name,
+        "final_filename": original_name,
+        "folder": cur_folder,
+        "source_file_size": file_size,
         "mime_type": mime_type,
         "media_type": media_type,
-        "chat_id": msg.chat_id,
-        "status_message_id": None
+        "status": "QUEUED"
     }
 
-    # Prompt user to select existing or create folder
+    context.user_data["pending_file"] = pending_data
+
+    # Display B2 folder selection interface
     b2_folders = await asyncio.to_thread(b2_storage.discover_folders)
-    cur_folder = context.user_data.get("selected_folder", "/")
 
     buttons = []
     root_icon = "🎯 " if cur_folder == "/" else "📁 "
@@ -1140,481 +1835,22 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         InlineKeyboardButton("➕ Create Folder", callback_data="folder_create"),
         InlineKeyboardButton("🔄 Refresh", callback_data="cmd_refresh_folders")
     ])
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dup_cancel")])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="job_cancel:none")])
 
     keyboard = InlineKeyboardMarkup(buttons)
     await msg.reply_text(
         f"📩 *File Received:* `{original_name}` ({format_size(file_size)})\n\n"
+        f"🎯 *Default Folder:* `{cur_folder}`\n"
         "📂 *Select Destination B2 Folder:*",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
 
-async def execute_storage_pipeline(update: Update, context: ContextTypes.DEFAULT_TYPE, folder: str):
-    pending = context.user_data.get("pending_file")
-    if not pending:
-        return
-
-    chat_id = pending["chat_id"]
-    original_name = pending["original_file_name"]
-    file_size = pending["file_size"]
-
-    # Initial Status Message
-    status_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "🎬 *Processing Workflow Started*\n\n"
-            f"📄 *Original File:* `{original_name}` ({format_size(file_size)})\n"
-            f"📁 *B2 Target Folder:* `{folder}`\n\n"
-            "⬇️ *Downloading Telegram file...*"
-        ),
-        parse_mode="Markdown"
-    )
-    pending["status_message_id"] = status_msg.message_id
-    pending["folder"] = folder
-
-    # Step 1: Disk Space Check
-    space_ok, space_msg = check_disk_space(int(file_size * 2.5))
-    if not space_ok:
-        await status_msg.edit_text(
-            f"❌ *STORAGE FAILED*\n\n"
-            f"📄 *File:* `{original_name}`\n"
-            f"📁 *Folder:* `{folder}`\n"
-            f"⬇️ Download: ⚪ Cancelled\n"
-            f"🎬 Processing: ⚪ Not started\n"
-            f"☁️ B2: ⚪ Not attempted\n"
-            f"🗄 Database: ⚪ Not indexed\n\n"
-            f"*Reason:* {space_msg}",
-            parse_mode="Markdown"
-        )
-        context.user_data.pop("pending_file", None)
-        return
-
-    # Step 2: Download Telegram file
-    local_download_path = TEMP_DIR / f"down_{int(time.time())}_{original_name}"
-    pending["local_download_path"] = local_download_path
-
-    try:
-        logger.info(f"Retrieving Telegram get_file API metadata for file_id: {pending['tg_file_id']}...")
-        tg_file = await context.bot.get_file(pending["tg_file_id"])
-        tg_file_path = getattr(tg_file, "file_path", "N/A")
-        actual_tg_size = getattr(tg_file, "file_size", file_size)
-
-        logger.info(
-            f"Telegram File API Response:\n"
-            f"  file_id: {pending['tg_file_id']}\n"
-            f"  file_unique_id: {pending.get('tg_file_unique_id', 'N/A')}\n"
-            f"  file_path: {tg_file_path}\n"
-            f"  file_size: {actual_tg_size} bytes ({format_size(actual_tg_size)})\n"
-            f"  filename: {original_name}\n"
-            f"  MIME type: {pending.get('mime_type', 'N/A')}"
-        )
-
-        await tg_file.download_to_drive(custom_path=local_download_path)
-
-        if not local_download_path.exists() or local_download_path.stat().st_size == 0:
-            raise FileNotFoundError("Downloaded Telegram file is missing or 0 bytes on disk.")
-
-        logger.info(f"File successfully saved to disk: {local_download_path} ({format_size(local_download_path.stat().st_size)})")
-
-    except telegram.error.BadRequest as e:
-        err_msg = str(e)
-        logger.error(f"Telegram BadRequest error: {err_msg}")
-
-        if "file is too big" in err_msg.lower():
-            reason_str = (
-                f"Telegram Bot API Download Limit Exceeded.\n\n"
-                f"• *Telegram file_size:* `{file_size}` bytes ({format_size(file_size)})\n"
-                f"• *Application Limit:* `{MAX_FILE_SIZE}` bytes ({format_size(MAX_FILE_SIZE)})\n"
-                f"• *Telegram API Message:* `{err_msg}`\n\n"
-                f"ℹ️ *Technical Explanation:* Standard Telegram Bot API servers (`api.telegram.org`) "
-                f"enforce a hard limit of **20 MiB** for bot file downloads (`getFile`). "
-                f"To process files up to 2 GiB / 4 GiB via Telegram, the bot must be connected to a custom local Telegram Bot API Server instance."
-            )
-        else:
-            reason_str = f"Telegram BadRequest Error: `{err_msg}`"
-
-        await status_msg.edit_text(
-            f"❌ *STORAGE FAILED*\n\n"
-            f"📄 *File:* `{original_name}`\n"
-            f"📁 *Folder:* `{folder}`\n"
-            f"⬇️ Download: ❌ Failed\n"
-            f"🎬 Processing: ⚪ Not attempted\n"
-            f"☁️ B2: ⚪ Not attempted\n"
-            f"🗄 Database: ⚪ Not indexed\n\n"
-            f"*Reason:* {reason_str}",
-            parse_mode="Markdown"
-        )
-        if local_download_path.exists():
-            local_download_path.unlink(missing_ok=True)
-        context.user_data.pop("pending_file", None)
-        return
-
-    except (telegram.error.TimedOut, asyncio.TimeoutError) as e:
-        logger.error(f"Telegram download timeout: {e}")
-        await status_msg.edit_text(
-            f"❌ *STORAGE FAILED*\n\n"
-            f"📄 *File:* `{original_name}`\n"
-            f"📁 *Folder:* `{folder}`\n"
-            f"⬇️ Download: ❌ Timeout\n"
-            f"🎬 Processing: ⚪ Not attempted\n"
-            f"☁️ B2: ⚪ Not attempted\n"
-            f"🗄 Database: ⚪ Not indexed\n\n"
-            f"*Reason:* Telegram download timed out (`{e}`)",
-            parse_mode="Markdown"
-        )
-        if local_download_path.exists():
-            local_download_path.unlink(missing_ok=True)
-        context.user_data.pop("pending_file", None)
-        return
-
-    except telegram.error.NetworkError as e:
-        logger.error(f"Telegram network error: {e}")
-        await status_msg.edit_text(
-            f"❌ *STORAGE FAILED*\n\n"
-            f"📄 *File:* `{original_name}`\n"
-            f"📁 *Folder:* `{folder}`\n"
-            f"⬇️ Download: ❌ Network Error\n"
-            f"🎬 Processing: ⚪ Not attempted\n"
-            f"☁️ B2: ⚪ Not attempted\n"
-            f"🗄 Database: ⚪ Not indexed\n\n"
-            f"*Reason:* Telegram network communication failure (`{e}`)",
-            parse_mode="Markdown"
-        )
-        if local_download_path.exists():
-            local_download_path.unlink(missing_ok=True)
-        context.user_data.pop("pending_file", None)
-        return
-
-    except Exception as e:
-        logger.error(f"Download exception ({type(e).__name__}): {e}")
-        await status_msg.edit_text(
-            f"❌ *STORAGE FAILED*\n\n"
-            f"📄 *File:* `{original_name}`\n"
-            f"📁 *Folder:* `{folder}`\n"
-            f"⬇️ Download: ❌ Failed ({type(e).__name__})\n"
-            f"🎬 Processing: ⚪ Not attempted\n"
-            f"☁️ B2: ⚪ Not attempted\n"
-            f"🗄 Database: ⚪ Not indexed\n\n"
-            f"*Reason:* Download failed ({type(e).__name__}: {e})",
-            parse_mode="Markdown"
-        )
-        if local_download_path.exists():
-            local_download_path.unlink(missing_ok=True)
-        context.user_data.pop("pending_file", None)
-        return
-
-    # Step 3: FFprobe Inspection
-    await status_msg.edit_text(
-        "🎬 *Processing Workflow*\n\n"
-        f"📄 *File:* `{original_name}`\n"
-        f"📁 *Folder:* `{folder}`\n\n"
-        "🔍 *Inspecting media properties with FFprobe...*",
-        parse_mode="Markdown"
-    )
-
-    is_video = False
-    media_info = {}
-    try:
-        media_info = await probe_media(local_download_path)
-        is_video = media_info.get("is_video", False)
-    except Exception as e:
-        logger.warning(f"FFprobe inspection note: {e}")
-
-    pending["is_video"] = is_video
-    pending["media_info"] = media_info
-
-    # Step 4: Video Processing (Remux vs Transcode)
-    if is_video:
-        v_codec = media_info.get("video_codec", "unknown")
-        a_codec = media_info.get("audio_codec", "unknown")
-        
-        output_mp4_name = Path(original_name).stem + ".mp4"
-        local_processed_path = TEMP_DIR / f"proc_{int(time.time())}_{output_mp4_name}"
-        pending["local_processed_path"] = local_processed_path
-        pending["processed_filename"] = output_mp4_name
-
-        await status_msg.edit_text(
-            "🎬 *Processing Video for Browser Playback*\n\n"
-            f"📄 *File:* `{original_name}`\n"
-            f"🔍 *Codecs Detected:* Video (`{v_codec}`), Audio (`{a_codec}`)\n"
-            f"⚙️ *Target:* MP4 + H.264 + AAC + yuv420p + faststart\n\n"
-            "⏳ *FFmpeg processing in progress...*",
-            parse_mode="Markdown"
-        )
-
-        success, mode, err_desc = await process_video_for_web(
-            local_download_path,
-            local_processed_path,
-            media_info
-        )
-        pending["processing_mode"] = mode
-
-        if not success:
-            await status_msg.edit_text(
-                f"❌ *STORAGE FAILED*\n\n"
-                f"📄 *File:* `{original_name}`\n"
-                f"📁 *Folder:* `{folder}`\n"
-                f"🎬 Processing: ❌ Failed ({mode})\n"
-                f"☁️ B2: ⚪ Not attempted\n"
-                f"🗄 Database: ⚪ Not indexed\n\n"
-                f"*Reason:* {err_desc}",
-                parse_mode="Markdown"
-            )
-            # Cleanup temp files
-            if local_download_path.exists():
-                local_download_path.unlink(missing_ok=True)
-            if local_processed_path.exists():
-                local_processed_path.unlink(missing_ok=True)
-            context.user_data.pop("pending_file", None)
-            return
-
-        pending["upload_path"] = local_processed_path
-        pending["final_size"] = local_processed_path.stat().st_size
-        pending["mime_type"] = "video/mp4"
-    else:
-        # Non-video document passthrough
-        pending["processing_mode"] = "passthrough"
-        pending["processed_filename"] = original_name
-        pending["upload_path"] = local_download_path
-        pending["final_size"] = local_download_path.stat().st_size
-
-    # Step 5: Ask User for Rename
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Yes, Rename", callback_data="rename_yes"),
-            InlineKeyboardButton("➡️ Keep Current Name", callback_data="rename_no")
-        ]
-    ])
-
-    current_target_name = pending["processed_filename"]
-    await status_msg.edit_text(
-        "✏️ *Rename File Before Upload?*\n\n"
-        f"📄 *Current Processed Name:* `{current_target_name}`\n"
-        f"📁 *Destination Folder:* `{folder}`\n"
-        f"⚙️ *Mode:* `{pending['processing_mode']}`",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-
-async def continue_pipeline_after_rename(update: Update, context: ContextTypes.DEFAULT_TYPE, rename_to: Optional[str]):
-    pending = context.user_data.get("pending_file")
-    if not pending:
-        return
-
-    is_video = pending.get("is_video", False)
-    if rename_to:
-        clean_name = sanitize_filename(rename_to)
-        if is_video and not clean_name.lower().endswith(".mp4"):
-            clean_name += ".mp4"
-        pending["final_file_name"] = clean_name
-    else:
-        pending["final_file_name"] = pending["processed_filename"]
-
-    folder = pending["folder"]
-    filename = pending["final_file_name"]
-    
-    # Construct B2 path key
-    if folder == "/":
-        b2_path = filename
-    else:
-        b2_path = f"{folder.strip('/')}/{filename}"
-
-    pending["b2_path"] = b2_path
-
-    # Step 6: B2 Duplicate Check
-    exists = await asyncio.to_thread(b2_storage.file_exists, b2_path)
-    chat_id = pending["chat_id"]
-    status_msg_id = pending["status_message_id"]
-
-    if exists:
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔄 Overwrite B2 File", callback_data="dup_overwrite"),
-                InlineKeyboardButton("✏️ Rename File", callback_data="dup_rename")
-            ],
-            [
-                InlineKeyboardButton("❌ Cancel", callback_data="dup_cancel")
-            ]
-        ])
-
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=status_msg_id,
-            text=(
-                "⚠️ *File Already Exists in B2*\n\n"
-                f"📁 *Folder:* `{folder}`\n"
-                f"📄 *File:* `{filename}`\n"
-                f"🔗 *B2 Path:* `{b2_path}`\n\n"
-                "Please select an action:"
-            ),
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
-        return
-
-    # Proceed directly to upload if no duplicate
-    await continue_pipeline_b2_upload(update, context, overwrite=False)
-
-async def continue_pipeline_b2_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, overwrite: bool):
-    pending = context.user_data.get("pending_file")
-    if not pending:
-        return
-
-    chat_id = pending["chat_id"]
-    status_msg_id = pending["status_message_id"]
-    upload_path = pending["upload_path"]
-    b2_path = pending["b2_path"]
-    filename = pending["final_file_name"]
-    folder = pending["folder"]
-    proc_mode = pending["processing_mode"]
-
-    # Step 7: Upload to Backblaze B2
-    await context.bot.edit_message_text(
-        chat_id=chat_id,
-        message_id=status_msg_id,
-        text=(
-            "🎬 *Processing Workflow*\n\n"
-            f"📄 *File:* `{filename}`\n"
-            f"📁 *Folder:* `{folder}`\n"
-            f"🎬 Processing: ✅ Success (`{proc_mode}`)\n"
-            "☁️ *Uploading to Backblaze B2...*"
-        ),
-        parse_mode="Markdown"
-    )
-
-    b2_result = None
-    b2_error = ""
-    try:
-        async with UPLOAD_SEMAPHORE:
-            b2_result = await asyncio.to_thread(
-                b2_storage.upload_file,
-                upload_path,
-                b2_path
-            )
-    except Exception as e:
-        logger.error(f"B2 upload error: {e}")
-        b2_error = str(e)
-
-    if not b2_result:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=status_msg_id,
-            text=(
-                "❌ *STORAGE FAILED*\n\n"
-                f"📄 *File:* `{filename}`\n"
-                f"📁 *Folder:* `{folder}`\n"
-                f"🎬 Processing: ✅ Success (`{proc_mode}`)\n"
-                "☁️ B2 Upload: ❌ Failed\n"
-                "🗄 Database: ⚪ Not indexed\n\n"
-                f"*Reason:* B2 Upload Error ({b2_error})"
-            ),
-            parse_mode="Markdown"
-        )
-        cleanup_temp_files(pending)
-        context.user_data.pop("pending_file", None)
-        return
-
-    # Step 8: Verify B2 Upload
-    b2_verified = await asyncio.to_thread(b2_storage.file_exists, b2_path)
-    if not b2_verified:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=status_msg_id,
-            text=(
-                "❌ *STORAGE FAILED*\n\n"
-                f"📄 *File:* `{filename}`\n"
-                f"📁 *Folder:* `{folder}`\n"
-                f"🎬 Processing: ✅ Success (`{proc_mode}`)\n"
-                "☁️ B2 Upload: ❌ Verification Failed\n"
-                "🗄 Database: ⚪ Not indexed\n\n"
-                "*Reason:* B2 Object key could not be verified post-upload."
-            ),
-            parse_mode="Markdown"
-        )
-        cleanup_temp_files(pending)
-        context.user_data.pop("pending_file", None)
-        return
-
-    # Step 9: Save Database Metadata Index
-    media_info = pending.get("media_info", {})
-    record = {
-        "file_name": filename,
-        "original_file_name": pending["original_file_name"],
-        "folder": folder,
-        "b2_bucket": B2_BUCKET_NAME,
-        "b2_path": b2_path,
-        "b2_file_id": b2_result.get("b2_file_id"),
-        "file_size": pending["final_size"],
-        "mime_type": pending.get("mime_type", "application/octet-stream"),
-        "media_type": pending.get("media_type", "document"),
-        "video_codec": media_info.get("video_codec"),
-        "audio_codec": media_info.get("audio_codec"),
-        "width": media_info.get("width"),
-        "height": media_info.get("height"),
-        "duration": media_info.get("duration"),
-        "processing_mode": proc_mode,
-        "status": "complete",
-        "b2_url": b2_result.get("b2_url")
-    }
-
-    db_rec_id = insert_file_record(record)
-
-    if not db_rec_id:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=status_msg_id,
-            text=(
-                "⚠️ *PARTIAL SUCCESS (DATABASE INDEX FAILED)*\n\n"
-                f"📄 *File:* `{filename}`\n"
-                f"📁 *Folder:* `{folder}`\n"
-                f"🎬 Processing: ✅ Success (`{proc_mode}`)\n"
-                f"☁️ B2: ✅ Uploaded & Verified\n"
-                f"🆔 B2 File ID: `{b2_result.get('b2_file_id')}`\n"
-                f"🗄 Database: ❌ Index Failed\n\n"
-                "*Note:* File is safe in B2, but database row creation encountered an error."
-            ),
-            parse_mode="Markdown"
-        )
-    else:
-        url_text = f"`{b2_result['b2_url']}`" if b2_result.get("b2_url") else "`N/A (Private Bucket)`"
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=status_msg_id,
-            text=(
-                "✅ *STORAGE WORKFLOW SUCCESSFUL*\n\n"
-                f"📄 *File:* `{filename}`\n"
-                f"📁 *Folder:* `{folder}`\n"
-                f"🎬 *Mode:* `{proc_mode}` (MP4 + H.264 + AAC + faststart)\n"
-                f"☁️ *B2 Bucket:* `{B2_BUCKET_NAME}`\n"
-                f"🆔 *B2 File ID:* `{b2_result.get('b2_file_id')}`\n"
-                f"🔗 *B2 Path:* `{b2_path}`\n"
-                f"🗄️ *DB Record ID:* `{db_rec_id}`\n"
-                f"🌐 *Public URL:* {url_text}"
-            ),
-            parse_mode="Markdown"
-        )
-
-    # Clean up local temporary files
-    cleanup_temp_files(pending)
-    context.user_data.pop("pending_file", None)
-
-def cleanup_temp_files(pending: Dict[str, Any]):
-    p_down = pending.get("local_download_path")
-    p_proc = pending.get("local_processed_path")
-    if p_down and isinstance(p_down, Path) and p_down.exists():
-        try:
-            p_down.unlink(missing_ok=True)
-        except Exception:
-            pass
-    if p_proc and isinstance(p_proc, Path) and p_proc.exists():
-        try:
-            p_proc.unlink(missing_ok=True)
-        except Exception:
-            pass
+# ============================================================
+# 12. GLOBAL ERROR HANDLER
+# ============================================================
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global exception handler for Telegram bot application updates."""
     err = context.error
     if isinstance(err, telegram.error.Conflict):
         logger.warning(
@@ -1629,37 +1865,29 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Unhandled exception in Telegram bot update loop: {err}", exc_info=err)
 
 # ============================================================
-# 10. MAIN ENTRY POINT & APPLICATION INITIALIZATION
+# 13. MAIN ENTRY POINT & APPLICATION INITIALIZATION
 # ============================================================
 
 def main():
-    logger.info("Starting Anime4u Storage & Media Bot...")
+    if "--setup-session" in sys.argv:
+        asyncio.run(setup_telethon_session_cli())
+        return
 
-    # Start Health Check HTTP server on PORT 3000
+    logger.info(f"Starting Anime4u Storage Bot & MTProto Worker Engine [SERVICE_MODE={SERVICE_MODE}]...")
+
     start_health_server()
-
-    # Initialize Database Schema
     init_db()
 
-    # Startup FFmpeg Check
     ffmpeg_ok, ffprobe_ok = check_ffmpeg_installed()
-    if ffmpeg_ok and ffprobe_ok:
-        logger.info("FFmpeg & FFprobe binaries detected successfully.")
-    else:
-        logger.warning(f"FFmpeg/FFprobe presence: FFmpeg={ffmpeg_ok}, FFprobe={ffprobe_ok}")
+    logger.info(f"FFmpeg presence: FFmpeg={ffmpeg_ok}, FFprobe={ffprobe_ok}")
 
-    # Startup B2 Check
     b2_ok, b2_msg = b2_storage.check_health()
-    if b2_ok:
-        logger.info(f"B2 Startup Check: {b2_msg}")
-    else:
-        logger.warning(f"B2 Startup Check Warning: {b2_msg}")
+    logger.info(f"B2 Startup Check: {b2_msg}")
 
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is missing. Please set BOT_TOKEN environment variable.")
+        logger.error("BOT_TOKEN environment variable is missing.")
         sys.exit(1)
 
-    # Initialize Telegram Application
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -1670,10 +1898,8 @@ def main():
         .build()
     )
 
-    # Register Global Error Handler
     app.add_error_handler(global_error_handler)
 
-    # Command Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("folders", folders_command))
@@ -1681,6 +1907,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("storage", storage_health_command))
     app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("jobs", jobs_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("admin", admin_panel_command))
     app.add_handler(CommandHandler("admins", list_admins_command))
@@ -1688,11 +1915,16 @@ def main():
     app.add_handler(CommandHandler("removeadmin", remove_admin_command))
     app.add_handler(CommandHandler("audit", audit_command))
 
-    # Callback Query Handler
     app.add_handler(CallbackQueryHandler(handle_callback_query))
-
-    # General Message Handler for File Uploads & Text Prompts
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_incoming_message))
+
+    # Mode-based Execution
+    if SERVICE_MODE in ["worker", "all"]:
+        # Launch worker loop as background task inside PTB event loop or standalone loop
+        async def post_init(application: Application):
+            asyncio.create_task(run_worker_loop(application))
+
+        app.post_init = post_init
 
     logger.info("Bot polling initiated...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)

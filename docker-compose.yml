@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  # Render Web Service / Bot Interface
+  telegram-bot:
+    build: .
+    container_name: anime4u-telegram-bot
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - SERVICE_MODE=render
+      - BOT_TOKEN=${BOT_TOKEN}
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - TELEGRAM_SESSION_STRING=${TELEGRAM_SESSION_STRING}
+      - B2_APPLICATION_KEY_ID=${B2_APPLICATION_KEY_ID}
+      - B2_APPLICATION_KEY=${B2_APPLICATION_KEY}
+      - B2_BUCKET_NAME=${B2_BUCKET_NAME}
+      - B2_PUBLIC_BASE_URL=${B2_PUBLIC_BASE_URL}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - DATABASE_PATH=/app/storage.db
+      - TEMP_DIR=/app/downloads
+      - MAX_FILE_SIZE_BYTES=4294967296
+    volumes:
+      - data-volume:/app
+
+  # VPS MTProto Worker Service
+  mtproto-worker:
+    build: .
+    container_name: anime4u-mtproto-worker
+    restart: always
+    environment:
+      - SERVICE_MODE=worker
+      - BOT_TOKEN=${BOT_TOKEN}
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - TELEGRAM_SESSION_STRING=${TELEGRAM_SESSION_STRING}
+      - B2_APPLICATION_KEY_ID=${B2_APPLICATION_KEY_ID}
+      - B2_APPLICATION_KEY=${B2_APPLICATION_KEY}
+      - B2_BUCKET_NAME=${B2_BUCKET_NAME}
+      - B2_PUBLIC_BASE_URL=${B2_PUBLIC_BASE_URL}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - DATABASE_PATH=/app/storage.db
+      - TEMP_DIR=/app/downloads
+      - MAX_FILE_SIZE_BYTES=4294967296
+    volumes:
+      - data-volume:/app
+
+volumes:
+  data-volume:

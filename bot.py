@@ -91,9 +91,35 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_FILE_SIZE_BYTES = int(os.getenv("MAX_FILE_SIZE_BYTES") or os.getenv("MAX_FILE_SIZE") or (4 * 1024 * 1024 * 1024))  # 4 GiB = 4,294,967,296 bytes
 MAX_CONCURRENT_UPLOADS = int(os.getenv("MAX_CONCURRENT_UPLOADS", 2))
-MAX_CONCURRENT_FFMPEG = int(os.getenv("MAX_CONCURRENT_FFMPEG", 1))
+MAX_CONCURRENT_FFMPEG = int(os.getenv("MAX_TRANSCODE_JOBS") or os.getenv("MAX_CONCURRENT_FFMPEG") or 1)
 PORT = int(os.getenv("PORT", 3000))
 PAGE_SIZE = int(os.getenv("PAGE_SIZE", 10))
+
+# FFmpeg Encoding & Performance Configuration
+VALID_FFMPEG_PRESETS = {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}
+_raw_preset = (os.getenv("FFMPEG_PRESET") or "veryfast").strip().lower()
+FFMPEG_PRESET = _raw_preset if _raw_preset in VALID_FFMPEG_PRESETS else "veryfast"
+
+try:
+    FFMPEG_CRF = int(os.getenv("FFMPEG_CRF", "23"))
+    if not (0 <= FFMPEG_CRF <= 51):
+        FFMPEG_CRF = 23
+except ValueError:
+    FFMPEG_CRF = 23
+
+try:
+    FFMPEG_THREADS = int(os.getenv("FFMPEG_THREADS", "0"))
+    if FFMPEG_THREADS < 0:
+        FFMPEG_THREADS = 0
+except ValueError:
+    FFMPEG_THREADS = 0
+
+try:
+    FFMPEG_STALL_TIMEOUT = int(os.getenv("FFMPEG_STALL_TIMEOUT", "120"))
+    if FFMPEG_STALL_TIMEOUT <= 0:
+        FFMPEG_STALL_TIMEOUT = 120
+except ValueError:
+    FFMPEG_STALL_TIMEOUT = 120
 
 # Semaphores for task rate limiting
 UPLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
@@ -553,7 +579,7 @@ def check_disk_space(required_bytes: int = 500 * 1024 * 1024) -> Tuple[bool, str
         stat = shutil.disk_usage(TEMP_DIR)
         free_bytes = stat.free
         if free_bytes < required_bytes:
-            return False, f"Free disk space ({format_size(free_bytes)}) is less than required ({format_size(required_bytes)})."
+            return False, f"Insufficient disk space: {format_size(free_bytes)} free, but {format_size(required_bytes)} required."
         return True, f"Disk space OK: {format_size(free_bytes)} free."
     except Exception as e:
         logger.warning(f"Disk space check exception: {e}")
@@ -648,15 +674,17 @@ async def process_video_for_web(
     total_duration = media_info.get("duration") or 0.0
 
     is_h264_compatible = v_codec in ["h264", "avc1"] and pix_fmt in ["yuv420p", "yuvj420p", ""]
-    is_aac_compatible = a_codec in ["aac"]
+    is_aac_compatible = a_codec in ["aac", "mp4a-40-2"]
 
     if is_h264_compatible:
         mode = "remux_fastpath"
         cmd = [
-            "ffmpeg", "-y",
+            "ffmpeg", "-hide_banner", "-y",
             "-progress", "pipe:1",
             "-nostats",
             "-i", str(input_path),
+            "-map", "0:v:0",
+            "-map", "0:a?",
             "-c:v", "copy",
             "-c:a", "copy" if is_aac_compatible else "aac",
         ]
@@ -666,14 +694,17 @@ async def process_video_for_web(
     else:
         mode = "transcode_h264"
         cmd = [
-            "ffmpeg", "-y",
+            "ffmpeg", "-hide_banner", "-y",
             "-progress", "pipe:1",
             "-nostats",
             "-i", str(input_path),
+            "-map", "0:v:0",
+            "-map", "0:a?",
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
+            "-preset", FFMPEG_PRESET,
+            "-crf", str(FFMPEG_CRF),
             "-pix_fmt", "yuv420p",
+            "-threads", str(FFMPEG_THREADS),
             "-c:a", "copy" if is_aac_compatible else "aac",
         ]
         if not is_aac_compatible and a_codec:
@@ -685,10 +716,14 @@ async def process_video_for_web(
     logger.info(f"[FFMPEG] Input codec: {v_codec}")
     logger.info(f"[FFMPEG] Output codec: {'copy' if is_h264_compatible else 'h264'}")
     logger.info(f"[FFMPEG] Duration: {total_duration}s")
+    logger.info(f"[FFMPEG] Preset: {FFMPEG_PRESET if mode == 'transcode_h264' else 'copy'}")
+    logger.info(f"[FFMPEG] CRF: {FFMPEG_CRF if mode == 'transcode_h264' else 'N/A'}")
+    logger.info(f"[FFMPEG] Threads: {'auto (0)' if FFMPEG_THREADS == 0 else FFMPEG_THREADS}")
     logger.info(f"[FFMPEG] Output: {output_path.resolve()}")
     logger.info(f"[FFMPEG] Command: {' '.join(cmd)}")
 
     async with FFMPEG_SEMAPHORE:
+        t_enc_start = time.time()
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -710,6 +745,7 @@ async def process_video_for_web(
         fps_str = "0"
         last_log_time = time.time()
         last_progress_time = time.time()
+        last_file_size = 0
         main_loop = asyncio.get_running_loop()
 
         def format_sec(sec: float) -> str:
@@ -720,15 +756,20 @@ async def process_video_for_web(
             return f"{h:02d}:{m:02d}:{s:02d}"
 
         while True:
-            # Check for stall timeout (120 seconds of no progress)
             now = time.time()
-            if now - last_progress_time > 120.0:
-                logger.error("[FFMPEG] Error: Process stalled for > 120 seconds without progress output. Terminating.")
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                break
+            # Stall detection: timeout if no progress lines or file growth for FFMPEG_STALL_TIMEOUT
+            if now - last_progress_time > FFMPEG_STALL_TIMEOUT:
+                curr_size = output_path.stat().st_size if output_path.exists() else 0
+                if curr_size > last_file_size:
+                    last_file_size = curr_size
+                    last_progress_time = now  # output file is actively being written
+                else:
+                    logger.error(f"[FFMPEG] Error: Process stalled (> {FFMPEG_STALL_TIMEOUT}s without progress). Terminating.")
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    break
 
             try:
                 line_bytes = await asyncio.wait_for(proc.stdout.readline(), timeout=5.0)
@@ -783,12 +824,28 @@ async def process_video_for_web(
         await stderr_task
 
         stderr_output = b"".join(stderr_chunks).decode("utf-8", errors="ignore")
+        total_enc_time = round(time.time() - t_enc_start, 2)
 
         if proc.returncode != 0:
             err_log = stderr_output[-1000:]
             logger.error(f"[FFMPEG] Exit code: {proc.returncode}")
             logger.error(f"[FFMPEG] Error: {err_log}")
             return False, mode, f"FFmpeg failed with exit code {proc.returncode}: {err_log}"
+
+        # Performance Logging
+        avg_speed = f"{(total_duration / total_enc_time):.2f}x" if total_duration > 0 and total_enc_time > 0 else speed_str
+        in_size = input_path.stat().st_size if input_path.exists() else 0
+        out_size = output_path.stat().st_size if output_path.exists() else 0
+
+        logger.info(f"[FFMPEG] Input duration: {int(total_duration)}s")
+        logger.info(f"[FFMPEG] Input size: {format_size(in_size)}")
+        logger.info(f"[FFMPEG] Output size: {format_size(out_size)}")
+        logger.info(f"[FFMPEG] Preset: {FFMPEG_PRESET if mode == 'transcode_h264' else 'copy'}")
+        logger.info(f"[FFMPEG] CRF: {FFMPEG_CRF if mode == 'transcode_h264' else 'N/A'}")
+        logger.info(f"[FFMPEG] Threads: {'auto (0)' if FFMPEG_THREADS == 0 else FFMPEG_THREADS}")
+        logger.info(f"[FFMPEG] Speed: {avg_speed}")
+        logger.info(f"[FFMPEG] FPS: {fps_str}")
+        logger.info(f"[FFMPEG] Completed in: {total_enc_time}s")
 
         # Output Validation
         if not output_path.exists() or output_path.stat().st_size == 0:
@@ -800,6 +857,8 @@ async def process_video_for_web(
             out_vcodec = (out_probe.get("video_codec") or "").lower()
             out_format = (out_probe.get("format_name") or "").lower()
             out_dur = out_probe.get("duration") or 0.0
+            out_pix = (out_probe.get("pix_fmt") or "").lower()
+            out_acodec = (out_probe.get("audio_codec") or "").lower()
 
             if out_vcodec not in ["h264", "avc1"]:
                 logger.error(f"[FFMPEG] Validation failed: Video codec is '{out_vcodec}', expected 'h264'.")
@@ -809,7 +868,14 @@ async def process_video_for_web(
                 logger.error(f"[FFMPEG] Validation failed: Container is '{out_format}', expected 'mp4'.")
                 return False, mode, f"Validation failed: Container format is '{out_format}'"
 
-            logger.info(f"[FFMPEG] Output Validation PASS: Size={format_size(output_path.stat().st_size)}, Codec={out_vcodec}, Format={out_format}, Duration={out_dur}s")
+            if out_pix not in ["yuv420p", "yuvj420p"]:
+                logger.warning(f"[FFMPEG] Validation warning: Pixel format is '{out_pix}' (expected yuv420p).")
+
+            if a_codec and not out_acodec:
+                logger.error("[FFMPEG] Validation failed: Audio stream missing in output.")
+                return False, mode, "Validation failed: Audio stream missing in output"
+
+            logger.info(f"[FFMPEG] Output Validation PASS: Size={format_size(out_size)}, Codec={out_vcodec}, PixFmt={out_pix}, Format={out_format}, Duration={out_dur}s")
 
         except Exception as ve:
             logger.error(f"[FFMPEG] Output validation error: {ve}")
@@ -985,6 +1051,8 @@ async def run_worker_diagnostics():
         ffmpeg_ok, ffprobe_ok = check_ffmpeg_installed()
         logger.info(f"[DIAGNOSTICS] FFmpeg Binary: {'✅ Present' if ffmpeg_ok else '❌ Missing'}")
         logger.info(f"[DIAGNOSTICS] FFprobe Binary: {'✅ Present' if ffprobe_ok else '❌ Missing'}")
+        logger.info(f"[DIAGNOSTICS] CPU Cores: {os.cpu_count() or 'Unknown'}")
+        logger.info(f"[DIAGNOSTICS] FFmpeg Preset: {FFMPEG_PRESET} | CRF: {FFMPEG_CRF} | Threads: {FFMPEG_THREADS} | Stall Timeout: {FFMPEG_STALL_TIMEOUT}s")
 
         space_ok, space_msg = check_disk_space()
         logger.info(f"[DIAGNOSTICS] Disk Space: {'✅ OK' if space_ok else f'⚠️ {space_msg}'}")
@@ -1091,7 +1159,7 @@ async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]
     )
 
     # 1. Disk Space Check
-    required_bytes = int(file_size * 2.2)
+    required_bytes = int(file_size * 2.5)
     space_ok, space_msg = check_disk_space(required_bytes)
     if not space_ok:
         err_text = (
@@ -1199,7 +1267,7 @@ async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]
             async def ffmpeg_progress_cb(pct: int, out_time_sec: float, speed_str: str, fps_str: str, total_duration: float, mode: str):
                 nonlocal last_ffmpeg_ui
                 now = time.time()
-                if now - last_ffmpeg_ui < 1.5:
+                if (now - last_ffmpeg_ui < 3.5) and (pct != 0 and pct != 100):
                     return
                 last_ffmpeg_ui = now
 
@@ -1577,19 +1645,6 @@ def sanitize_filename(name: str) -> str:
     cleaned = name.replace("\0", "").replace("..", "_").replace("\\", "/")
     cleaned = re.sub(r'[/*?:"<>|]', '_', cleaned)
     return cleaned.strip()
-
-def check_disk_space(required_bytes: int = 500 * 1024 * 1024) -> Tuple[bool, str]:
-    try:
-        total, used, free = shutil.disk_usage(TEMP_DIR)
-        if free < required_bytes:
-            return False, (
-                f"Insufficient temporary disk space.\n"
-                f"• Required: {required_bytes} bytes ({format_size(required_bytes)})\n"
-                f"• Available: {free} bytes ({format_size(free)})"
-            )
-        return True, f"Disk space OK: {format_size(free)} free."
-    except Exception as e:
-        return True, str(e)
 
 # ============================================================
 # 8. HTTP HEALTH CHECK SERVER (PORT 3000)

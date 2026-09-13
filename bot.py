@@ -66,7 +66,7 @@ def start_health_check_server():
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8769661029:AAED5_SSFoU-Q_xQ_-p-x5FqzU7J9MZcIaE").strip()
 STORAGE_CHANNEL_ID_RAW = os.getenv("STORAGE_CHANNEL_ID", "-1004364304959").strip()
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "8525952693").strip()
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "5192451273").strip()
 
 try:
     STORAGE_CHANNEL_ID = int(STORAGE_CHANNEL_ID_RAW) if STORAGE_CHANNEL_ID_RAW else 0

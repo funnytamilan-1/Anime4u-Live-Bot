@@ -66,7 +66,7 @@ DB_PATH = os.getenv("DATABASE_PATH", "./storage.db")
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "./downloads"))
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 2147483648))  # 2 GB default
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 4 * 1024 * 1024 * 1024))  # 4 GiB = 4,294,967,296 bytes
 MAX_CONCURRENT_UPLOADS = int(os.getenv("MAX_CONCURRENT_UPLOADS", 2))
 MAX_CONCURRENT_FFMPEG = int(os.getenv("MAX_CONCURRENT_FFMPEG", 1))
 PORT = int(os.getenv("PORT", 3000))
@@ -77,6 +77,7 @@ UPLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
 FFMPEG_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_FFMPEG)
 
 # Import Telegram dependencies
+import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -606,6 +607,16 @@ async def deny_access(update: Update):
     elif update.message:
         await update.message.reply_text(msg, parse_mode="Markdown")
 
+def format_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.2f} KiB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MiB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GiB"
+
 def sanitize_filename(name: str) -> str:
     cleaned = name.replace("\0", "").replace("..", "_").replace("\\", "/")
     cleaned = re.sub(r'[/*?:"<>|]', '_', cleaned)
@@ -615,9 +626,11 @@ def check_disk_space(required_bytes: int) -> Tuple[bool, str]:
     try:
         total, used, free = shutil.disk_usage(TEMP_DIR)
         if free < required_bytes:
-            req_mb = required_bytes / (1024 * 1024)
-            free_mb = free / (1024 * 1024)
-            return False, f"Not enough disk space. Required: {req_mb:.1f} MB, Free: {free_mb:.1f} MB"
+            return False, (
+                f"Insufficient temporary disk space.\n"
+                f"• Required: {required_bytes} bytes ({format_size(required_bytes)})\n"
+                f"• Available: {free} bytes ({format_size(free)})"
+            )
         return True, "Disk space OK"
     except Exception as e:
         return True, str(e)
@@ -1071,20 +1084,35 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
     file_size = getattr(file_obj, "file_size", 0)
     mime_type = getattr(file_obj, "mime_type", "application/octet-stream")
     media_type = "video" if msg.video else ("audio" if msg.audio else "document")
+    file_id = getattr(file_obj, "file_id", "N/A")
+    file_unique_id = getattr(file_obj, "file_unique_id", "N/A")
 
-    if file_size > MAX_FILE_SIZE:
-        sz_gb = file_size / (1024 * 1024 * 1024)
-        max_gb = MAX_FILE_SIZE / (1024 * 1024 * 1024)
+    # Log real Telegram file metadata
+    logger.info(
+        f"Incoming Telegram File Metadata:\n"
+        f"  file_id: {file_id}\n"
+        f"  file_unique_id: {file_unique_id}\n"
+        f"  file_size: {file_size} bytes ({format_size(file_size)})\n"
+        f"  filename: {original_name}\n"
+        f"  MIME type: {mime_type}\n"
+        f"  Application limit: {MAX_FILE_SIZE} bytes ({format_size(MAX_FILE_SIZE)})"
+    )
+
+    if file_size and file_size > MAX_FILE_SIZE:
         await msg.reply_text(
-            f"❌ *File Size Error*\n\n"
-            f"File size `{sz_gb:.2f} GB` exceeds the application limit of `{max_gb:.2f} GB`.",
+            f"❌ *Application Size Limit Exceeded*\n\n"
+            f"• *File:* `{original_name}`\n"
+            f"• *File Size:* `{file_size}` bytes ({format_size(file_size)})\n"
+            f"• *Application Limit:* `{MAX_FILE_SIZE}` bytes ({format_size(MAX_FILE_SIZE)})\n\n"
+            f"The application maximum is 4 GiB (4,294,967,296 bytes).",
             parse_mode="Markdown"
         )
         return
 
     # Save pending file context
     context.user_data["pending_file"] = {
-        "tg_file_id": file_obj.file_id,
+        "tg_file_id": file_id,
+        "tg_file_unique_id": file_unique_id,
         "original_file_name": original_name,
         "file_size": file_size,
         "mime_type": mime_type,
@@ -1116,7 +1144,7 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
 
     keyboard = InlineKeyboardMarkup(buttons)
     await msg.reply_text(
-        f"📩 *File Received:* `{original_name}` ({file_size / (1024*1024):.1f} MB)\n\n"
+        f"📩 *File Received:* `{original_name}` ({format_size(file_size)})\n\n"
         "📂 *Select Destination B2 Folder:*",
         reply_markup=keyboard,
         parse_mode="Markdown"
@@ -1136,7 +1164,7 @@ async def execute_storage_pipeline(update: Update, context: ContextTypes.DEFAULT
         chat_id=chat_id,
         text=(
             "🎬 *Processing Workflow Started*\n\n"
-            f"📄 *Original File:* `{original_name}`\n"
+            f"📄 *Original File:* `{original_name}` ({format_size(file_size)})\n"
             f"📁 *B2 Target Folder:* `{folder}`\n\n"
             "⬇️ *Downloading Telegram file...*"
         ),
@@ -1152,6 +1180,7 @@ async def execute_storage_pipeline(update: Update, context: ContextTypes.DEFAULT
             f"❌ *STORAGE FAILED*\n\n"
             f"📄 *File:* `{original_name}`\n"
             f"📁 *Folder:* `{folder}`\n"
+            f"⬇️ Download: ⚪ Cancelled\n"
             f"🎬 Processing: ⚪ Not started\n"
             f"☁️ B2: ⚪ Not attempted\n"
             f"🗄 Database: ⚪ Not indexed\n\n"
@@ -1166,14 +1195,45 @@ async def execute_storage_pipeline(update: Update, context: ContextTypes.DEFAULT
     pending["local_download_path"] = local_download_path
 
     try:
+        logger.info(f"Retrieving Telegram get_file API metadata for file_id: {pending['tg_file_id']}...")
         tg_file = await context.bot.get_file(pending["tg_file_id"])
+        tg_file_path = getattr(tg_file, "file_path", "N/A")
+        actual_tg_size = getattr(tg_file, "file_size", file_size)
+
+        logger.info(
+            f"Telegram File API Response:\n"
+            f"  file_id: {pending['tg_file_id']}\n"
+            f"  file_unique_id: {pending.get('tg_file_unique_id', 'N/A')}\n"
+            f"  file_path: {tg_file_path}\n"
+            f"  file_size: {actual_tg_size} bytes ({format_size(actual_tg_size)})\n"
+            f"  filename: {original_name}\n"
+            f"  MIME type: {pending.get('mime_type', 'N/A')}"
+        )
+
         await tg_file.download_to_drive(custom_path=local_download_path)
 
         if not local_download_path.exists() or local_download_path.stat().st_size == 0:
-            raise FileNotFoundError("Downloaded Telegram file is empty or missing from disk.")
+            raise FileNotFoundError("Downloaded Telegram file is missing or 0 bytes on disk.")
 
-    except Exception as e:
-        logger.error(f"Telegram download failed: {e}")
+        logger.info(f"File successfully saved to disk: {local_download_path} ({format_size(local_download_path.stat().st_size)})")
+
+    except telegram.error.BadRequest as e:
+        err_msg = str(e)
+        logger.error(f"Telegram BadRequest error: {err_msg}")
+
+        if "file is too big" in err_msg.lower():
+            reason_str = (
+                f"Telegram Bot API Download Limit Exceeded.\n\n"
+                f"• *Telegram file_size:* `{file_size}` bytes ({format_size(file_size)})\n"
+                f"• *Application Limit:* `{MAX_FILE_SIZE}` bytes ({format_size(MAX_FILE_SIZE)})\n"
+                f"• *Telegram API Message:* `{err_msg}`\n\n"
+                f"ℹ️ *Technical Explanation:* Standard Telegram Bot API servers (`api.telegram.org`) "
+                f"enforce a hard limit of **20 MiB** for bot file downloads (`getFile`). "
+                f"To process files up to 2 GiB / 4 GiB via Telegram, the bot must be connected to a custom local Telegram Bot API Server instance."
+            )
+        else:
+            reason_str = f"Telegram BadRequest Error: `{err_msg}`"
+
         await status_msg.edit_text(
             f"❌ *STORAGE FAILED*\n\n"
             f"📄 *File:* `{original_name}`\n"
@@ -1182,7 +1242,61 @@ async def execute_storage_pipeline(update: Update, context: ContextTypes.DEFAULT
             f"🎬 Processing: ⚪ Not attempted\n"
             f"☁️ B2: ⚪ Not attempted\n"
             f"🗄 Database: ⚪ Not indexed\n\n"
-            f"*Reason:* Download failed ({e})",
+            f"*Reason:* {reason_str}",
+            parse_mode="Markdown"
+        )
+        if local_download_path.exists():
+            local_download_path.unlink(missing_ok=True)
+        context.user_data.pop("pending_file", None)
+        return
+
+    except (telegram.error.TimedOut, asyncio.TimeoutError) as e:
+        logger.error(f"Telegram download timeout: {e}")
+        await status_msg.edit_text(
+            f"❌ *STORAGE FAILED*\n\n"
+            f"📄 *File:* `{original_name}`\n"
+            f"📁 *Folder:* `{folder}`\n"
+            f"⬇️ Download: ❌ Timeout\n"
+            f"🎬 Processing: ⚪ Not attempted\n"
+            f"☁️ B2: ⚪ Not attempted\n"
+            f"🗄 Database: ⚪ Not indexed\n\n"
+            f"*Reason:* Telegram download timed out (`{e}`)",
+            parse_mode="Markdown"
+        )
+        if local_download_path.exists():
+            local_download_path.unlink(missing_ok=True)
+        context.user_data.pop("pending_file", None)
+        return
+
+    except telegram.error.NetworkError as e:
+        logger.error(f"Telegram network error: {e}")
+        await status_msg.edit_text(
+            f"❌ *STORAGE FAILED*\n\n"
+            f"📄 *File:* `{original_name}`\n"
+            f"📁 *Folder:* `{folder}`\n"
+            f"⬇️ Download: ❌ Network Error\n"
+            f"🎬 Processing: ⚪ Not attempted\n"
+            f"☁️ B2: ⚪ Not attempted\n"
+            f"🗄 Database: ⚪ Not indexed\n\n"
+            f"*Reason:* Telegram network communication failure (`{e}`)",
+            parse_mode="Markdown"
+        )
+        if local_download_path.exists():
+            local_download_path.unlink(missing_ok=True)
+        context.user_data.pop("pending_file", None)
+        return
+
+    except Exception as e:
+        logger.error(f"Download exception ({type(e).__name__}): {e}")
+        await status_msg.edit_text(
+            f"❌ *STORAGE FAILED*\n\n"
+            f"📄 *File:* `{original_name}`\n"
+            f"📁 *Folder:* `{folder}`\n"
+            f"⬇️ Download: ❌ Failed ({type(e).__name__})\n"
+            f"🎬 Processing: ⚪ Not attempted\n"
+            f"☁️ B2: ⚪ Not attempted\n"
+            f"🗄 Database: ⚪ Not indexed\n\n"
+            f"*Reason:* Download failed ({type(e).__name__}: {e})",
             parse_mode="Markdown"
         )
         if local_download_path.exists():
@@ -1531,7 +1645,15 @@ def main():
         sys.exit(1)
 
     # Initialize Telegram Application
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .read_timeout(300)
+        .write_timeout(300)
+        .connect_timeout(60)
+        .get_updates_read_timeout(60)
+        .build()
+    )
 
     # Command Handlers
     app.add_handler(CommandHandler("start", start_command))

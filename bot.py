@@ -49,10 +49,16 @@ except ImportError:
 # 1. CONFIGURATION & ENVIRONMENT VARIABLES
 # ============================================================
 
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or "8769661029:AAED5_SSFoU-Q_xQ_-p-x5FqzU7J9MZcIaE").strip()
-API_ID_RAW = (os.getenv("API_ID") or "27806628").strip()
-API_HASH = (os.getenv("API_HASH") or "25d88301e886b82826a525b7cf52e090").strip()
-TELEGRAM_SESSION_STRING = (os.getenv("TELEGRAM_SESSION_STRING") or "").strip()
+def _get_env(key: str, default: str) -> str:
+    val = (os.getenv(key) or "").strip()
+    if not val or val.startswith("YOUR_") or val in ["YOUR_TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN", "YOUR_API_ID", "YOUR_API_HASH"]:
+        return default
+    return val
+
+BOT_TOKEN = _get_env("BOT_TOKEN", "8769661029:AAED5_SSFoU-Q_xQ_-p-x5FqzU7J9MZcIaE")
+API_ID_RAW = _get_env("API_ID", "27806628")
+API_HASH = _get_env("API_HASH", "25d88301e886b82826a525b7cf52e090")
+TELEGRAM_SESSION_STRING = _get_env("TELEGRAM_SESSION_STRING", "")
 
 API_ID: Optional[int] = None
 if API_ID_RAW and API_ID_RAW.isdigit():
@@ -60,7 +66,7 @@ if API_ID_RAW and API_ID_RAW.isdigit():
 
 SERVICE_MODE = (os.getenv("SERVICE_MODE") or "all").strip().lower()  # 'render', 'worker', or 'all'
 
-ADMIN_IDS_RAW = (os.getenv("ADMIN_IDS") or "5192451273, 8525952693").strip()
+ADMIN_IDS_RAW = _get_env("ADMIN_IDS", "5192451273, 8525952693")
 ADMIN_IDS: Set[int] = set()
 if ADMIN_IDS_RAW:
     for item in ADMIN_IDS_RAW.split(","):
@@ -71,10 +77,10 @@ if ADMIN_IDS_RAW:
             except ValueError:
                 pass
 
-B2_APPLICATION_KEY_ID = (os.getenv("B2_APPLICATION_KEY_ID") or "0054467fa469dc20000000002").strip()
-B2_APPLICATION_KEY = (os.getenv("B2_APPLICATION_KEY") or "K005ACvE5pP0RYQr4cplDYDSE96uMtA").strip()
-B2_BUCKET_NAME = (os.getenv("B2_BUCKET_NAME") or "anime4u-videos").strip()
-B2_PUBLIC_BASE_URL = (os.getenv("B2_PUBLIC_BASE_URL") or "").rstrip("/")
+B2_APPLICATION_KEY_ID = _get_env("B2_APPLICATION_KEY_ID", "0054467fa469dc20000000002")
+B2_APPLICATION_KEY = _get_env("B2_APPLICATION_KEY", "K005ACvE5pP0RYQr4cplDYDSE96uMtA")
+B2_BUCKET_NAME = _get_env("B2_BUCKET_NAME", "anime4u-videos")
+B2_PUBLIC_BASE_URL = _get_env("B2_PUBLIC_BASE_URL", "").rstrip("/")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
@@ -422,9 +428,9 @@ class B2StorageEngine:
     def is_configured(self) -> bool:
         return bool(self.key_id and self.application_key and self.bucket_name)
 
-    def _get_bucket(self):
+    def _get_bucket(self, force_reauth: bool = False):
         with self._lock:
-            if self._bucket:
+            if self._bucket and not force_reauth:
                 return self._bucket
             if not self.is_configured():
                 raise ValueError("B2 credentials (B2_APPLICATION_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_NAME) are missing.")
@@ -438,6 +444,8 @@ class B2StorageEngine:
                 logger.info(f"Successfully connected to Backblaze B2 bucket: {self.bucket_name}")
                 return self._bucket
             except Exception as e:
+                self._bucket = None
+                self._b2_api = None
                 logger.error(f"Failed to authenticate with Backblaze B2: {e}")
                 raise
 
@@ -445,11 +453,13 @@ class B2StorageEngine:
         if not self.is_configured():
             return False, "B2 credentials missing in environment variables."
         try:
-            bucket = self._get_bucket()
+            bucket = self._get_bucket(force_reauth=True)
             generator = bucket.ls(fetch_count=1)
             next(generator, None)
             return True, f"B2 Bucket '{self.bucket_name}' authenticated & verified."
         except Exception as e:
+            self._bucket = None
+            self._b2_api = None
             return False, f"B2 Health Check Error: {e}"
 
     def discover_folders(self) -> List[str]:
@@ -1927,7 +1937,16 @@ def main():
         app.post_init = post_init
 
     logger.info("Bot polling initiated...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    try:
+        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    except telegram.error.InvalidToken as exc:
+        logger.error(f"Invalid Telegram bot token: {exc}. Web HTTP server remains active on port {PORT}.")
+        while True:
+            time.sleep(3600)
+    except Exception as exc:
+        logger.error(f"Telegram polling error: {exc}. Web HTTP server remains active on port {PORT}.")
+        while True:
+            time.sleep(3600)
 
 if __name__ == "__main__":
     main()

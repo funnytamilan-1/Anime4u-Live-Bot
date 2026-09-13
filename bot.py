@@ -162,9 +162,6 @@ def get_sqlite_conn():
     return conn
 
 def init_db():
-    if supabase_client:
-        return
-
     conn = get_sqlite_conn()
     cursor = conn.cursor()
 
@@ -224,10 +221,26 @@ def init_db():
             progress_stage TEXT DEFAULT 'QUEUED',
             error_stage TEXT,
             error_message TEXT,
+            worker_node TEXT,
+            claimed_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
     """)
+
+    # Dynamic column migrations if table already existed without new columns
+    cursor.execute("PRAGMA table_info(jobs)")
+    cols = {row[1] for row in cursor.fetchall()}
+    if "worker_node" not in cols:
+        try:
+            cursor.execute("ALTER TABLE jobs ADD COLUMN worker_node TEXT")
+        except Exception:
+            pass
+    if "claimed_at" not in cols:
+        try:
+            cursor.execute("ALTER TABLE jobs ADD COLUMN claimed_at TEXT")
+        except Exception:
+            pass
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS audit_logs (
@@ -247,6 +260,38 @@ def init_db():
     conn.commit()
     conn.close()
     logger.info("SQLite database & job queue schema initialized successfully.")
+
+def recover_stale_jobs(stale_timeout_sec: int = 600) -> int:
+    """Reset jobs that were claimed by a previous dead worker process back to QUEUED."""
+    conn = get_sqlite_conn()
+    cursor = conn.cursor()
+    try:
+        now_ts = time.time()
+        cursor.execute("SELECT job_id, status, updated_at FROM jobs WHERE status IN ('CLAIMED', 'DOWNLOADING', 'INSPECTING', 'REMUXING', 'TRANSCODING', 'UPLOADING', 'VERIFYING')")
+        rows = cursor.fetchall()
+        recovered = 0
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for r in rows:
+            jid = r["job_id"]
+            upd = r["updated_at"]
+            try:
+                dt = datetime.fromisoformat(upd.replace("Z", "+00:00"))
+                if now_ts - dt.timestamp() > stale_timeout_sec:
+                    cursor.execute("UPDATE jobs SET status = 'QUEUED', progress_stage = 'QUEUED', progress_percent = 0, updated_at = ? WHERE job_id = ?", (now_iso, jid))
+                    recovered += 1
+                    logger.info(f"[WORKER] Recovered stale job {jid} (previous status: {r['status']}) back to QUEUED.")
+            except Exception:
+                pass
+        conn.commit()
+        conn.close()
+        return recovered
+    except Exception as e:
+        logger.warning(f"[WORKER] Stale job recovery note: {e}")
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return 0
 
 def create_job(job_data: Dict[str, Any]) -> str:
     job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:6]}"
@@ -314,8 +359,10 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     conn.close()
     return dict(row) if row else None
 
-def claim_next_queued_job() -> Optional[Dict[str, Any]]:
-    """Atomically fetch and claim the next QUEUED job by updating its status to DOWNLOADING."""
+def claim_next_queued_job(worker_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Atomically fetch and claim the next QUEUED job by updating its status to CLAIMED."""
+    if not worker_id:
+        worker_id = f"{os.uname().nodename}:{os.getpid()}"
     conn = get_sqlite_conn()
     cursor = conn.cursor()
     try:
@@ -329,8 +376,8 @@ def claim_next_queued_job() -> Optional[Dict[str, Any]]:
         job_data = dict(row)
         now_iso = datetime.now(timezone.utc).isoformat()
         cursor.execute(
-            "UPDATE jobs SET status = 'DOWNLOADING', progress_stage = 'DOWNLOADING', progress_percent = 0, updated_at = ? WHERE job_id = ? AND status = 'QUEUED'",
-            (now_iso, job_data["job_id"])
+            "UPDATE jobs SET status = 'CLAIMED', progress_stage = 'CLAIMED', progress_percent = 0, worker_node = ?, claimed_at = ?, updated_at = ? WHERE job_id = ? AND status = 'QUEUED'",
+            (worker_id, now_iso, now_iso, job_data["job_id"])
         )
         if cursor.rowcount == 0:
             conn.commit()
@@ -338,9 +385,11 @@ def claim_next_queued_job() -> Optional[Dict[str, Any]]:
             return None
         conn.commit()
         conn.close()
-        job_data["status"] = "DOWNLOADING"
-        job_data["progress_stage"] = "DOWNLOADING"
+        job_data["status"] = "CLAIMED"
+        job_data["progress_stage"] = "CLAIMED"
         job_data["progress_percent"] = 0
+        job_data["worker_node"] = worker_id
+        job_data["claimed_at"] = now_iso
         job_data["updated_at"] = now_iso
         return job_data
     except Exception as e:
@@ -1115,7 +1164,8 @@ async def run_worker_loop_core(bot_instance: Optional[Any] = None, shutdown_even
     """Core long-running worker processing loop."""
     global worker_running
     worker_running = True
-    logger.info("[WORKER] Worker loop running")
+    logger.info("[WORKER] Starting queue consumer")
+    logger.info("[WORKER] Worker loop ACTIVE")
     logger.info("[WORKER] Waiting for jobs...")
 
     last_waiting_log = 0.0
@@ -1138,6 +1188,9 @@ async def run_worker_loop_core(bot_instance: Optional[Any] = None, shutdown_even
                 continue
 
             consecutive_errors = 0
+            job_id = job["job_id"]
+            orig_name = job.get("original_filename", "unknown")
+            logger.info(f"[WORKER] Processing job {job_id} ({orig_name})...")
             async with worker_lock:
                 await process_single_job(job, ptb_app=None, direct_bot=bot_instance)
 
@@ -1154,16 +1207,19 @@ async def run_worker_loop_core(bot_instance: Optional[Any] = None, shutdown_even
             except asyncio.CancelledError:
                 break
 
-    logger.info("[WORKER] Worker loop stopped.")
+    logger.info("[WORKER] Stopping queue consumer")
 
 async def run_worker_lifecycle():
     """Manages the full lifecycle of the worker node including graceful signal shutdown."""
-    logger.info("[WORKER] Starting worker lifecycle...")
+    start_time_iso = datetime.now(timezone.utc).isoformat()
+    logger.info(f"[PROCESS] Main lifecycle entered (PID: {os.getpid()}, Start time: {start_time_iso}, Mode: {SERVICE_MODE})")
+    logger.info("[WORKER] Starting worker lifecycle")
 
     shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
     def handle_signal(sig_name: str):
+        logger.info(f"[PROCESS] {sig_name} received")
         logger.info(f"[WORKER] Shutdown signal received ({sig_name})")
         shutdown_event.set()
 
@@ -1172,6 +1228,11 @@ async def run_worker_lifecycle():
             loop.add_signal_handler(sig, lambda s=sig.name: handle_signal(s))
         except (NotImplementedError, AttributeError):
             signal.signal(sig, lambda s, f, s_name=sig.name: handle_signal(s_name))
+
+    # Recover any stale jobs from previous restarts
+    recovered_jobs = recover_stale_jobs(stale_timeout_sec=600)
+    if recovered_jobs > 0:
+        logger.info(f"[WORKER] Stale job recovery initialized: {recovered_jobs} job(s) reset to QUEUED.")
 
     try:
         await run_worker_diagnostics()
@@ -1182,9 +1243,10 @@ async def run_worker_lifecycle():
         logger.info("[WORKER] Shutdown requested during startup.")
         return
 
+    logger.info("[WORKER] Connecting Telethon")
     client = await get_telethon_client()
     if client:
-        logger.info("[WORKER] Persistent Telethon connected")
+        logger.info("[WORKER] Telethon connected")
     else:
         logger.warning("[WORKER] Persistent Telethon client not available. Worker running in fallback mode.")
 
@@ -1208,15 +1270,15 @@ async def run_worker_lifecycle():
             logger.warning(f"[WORKER] Standalone bot instance initialization note: {e}")
 
     worker_task = asyncio.create_task(run_worker_loop_core(bot_instance=bot_instance, shutdown_event=shutdown_event))
+    logger.info("[PROCESS] Main lifecycle waiting")
 
     # Keep worker process alive awaiting shutdown signal or task termination
     try:
         await shutdown_event.wait()
     except asyncio.CancelledError:
-        logger.info("[WORKER] Lifecycle received cancellation.")
+        logger.info("[PROCESS] Main lifecycle cancelled.")
 
     # Graceful shutdown sequence
-    logger.info("[WORKER] Stopping worker...")
     global worker_running
     worker_running = False
 
@@ -1230,6 +1292,7 @@ async def run_worker_lifecycle():
             logger.error(f"[WORKER] Error awaiting worker task during shutdown: {e}")
 
     if telethon_client:
+        logger.info("[WORKER] Disconnecting Telethon")
         try:
             if telethon_client.is_connected():
                 await telethon_client.disconnect()
@@ -1243,7 +1306,8 @@ async def run_worker_lifecycle():
         except Exception:
             pass
 
-    logger.info("[WORKER] Worker shutdown complete")
+    logger.info("[WORKER] Shutdown complete")
+    logger.info("[PROCESS] Main lifecycle exiting (Exit code: 0)")
 
 async def run_worker_loop(ptb_app: Optional[Application] = None):
     bot_client = ptb_app.bot if ptb_app else None
@@ -1808,10 +1872,42 @@ def sanitize_filename(name: str) -> str:
 # ============================================================
 
 _http_server_instance: Optional[HTTPServer] = None
+_process_start_time = time.time()
 
 class HealthHandler(BaseHTTPRequestHandler):
+    def get_health_payload(self) -> bytes:
+        telethon_status = "unconfigured"
+        if API_ID and API_HASH and TELETHON_AVAILABLE:
+            if telethon_client and telethon_client.is_connected():
+                telethon_status = "connected"
+            else:
+                telethon_status = "configured_idle"
+
+        queue_status = "healthy"
+        try:
+            conn = get_sqlite_conn()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM jobs WHERE status = 'QUEUED'")
+            q_cnt = cursor.fetchone()[0]
+            conn.close()
+            queue_status = f"healthy ({q_cnt} queued)"
+        except Exception:
+            queue_status = "accessible"
+
+        payload = {
+            "status": "ok",
+            "service": "b2-telegram-storage-bot",
+            "service_mode": SERVICE_MODE,
+            "worker": "active" if worker_running else "idle",
+            "telethon": telethon_status,
+            "queue": queue_status,
+            "pid": os.getpid(),
+            "uptime_sec": int(time.time() - _process_start_time)
+        }
+        return (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+
     def do_GET(self):
-        body = b'{"status": "ok", "service": "b2-telegram-storage-bot", "mode": "' + SERVICE_MODE.encode() + b'"}\n'
+        body = self.get_health_payload()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -1819,7 +1915,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_HEAD(self):
-        body = b'{"status": "ok", "service": "b2-telegram-storage-bot", "mode": "' + SERVICE_MODE.encode() + b'"}\n'
+        body = self.get_health_payload()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

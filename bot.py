@@ -822,18 +822,39 @@ async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]
     bot_client = ptb_app.bot if ptb_app else None
 
     async def notify_ui(text: str, reply_markup=None):
-        if not bot_client or not status_msg_id:
+        nonlocal status_msg_id
+        if not bot_client:
             return
+        if not status_msg_id:
+            curr_job = get_job(job_id)
+            if curr_job and curr_job.get("status_message_id"):
+                status_msg_id = curr_job["status_message_id"]
+
+        if status_msg_id:
+            try:
+                await bot_client.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_msg_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode="Markdown"
+                )
+                return
+            except Exception as e:
+                logger.debug(f"UI notification edit exception for msg {status_msg_id}: {e}")
+
         try:
-            await bot_client.edit_message_text(
+            sent = await bot_client.send_message(
                 chat_id=chat_id,
-                message_id=status_msg_id,
                 text=text,
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
+            if sent and hasattr(sent, "message_id"):
+                status_msg_id = sent.message_id
+                update_job(job_id, {"status_message_id": status_msg_id})
         except Exception as e:
-            logger.debug(f"UI notification edit exception: {e}")
+            logger.error(f"Fallback send_message failed in notify_ui: {e}")
 
     await notify_ui(
         "🎬 *Processing Workflow Started*\n\n"
@@ -1660,7 +1681,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             job_id = create_job(pending)
             context.user_data.pop("pending_file", None)
 
-            await query.edit_message_text(
+            sent_msg = await query.edit_message_text(
                 "🎬 *Job Queued Successfully*\n\n"
                 f"📄 *File:* `{pending['original_filename']}` ({format_size(pending['source_file_size'])})\n"
                 f"📁 *B2 Target Folder:* `{folder}`\n"
@@ -1668,6 +1689,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 "⏳ *Queued for MTProto worker processing...*",
                 parse_mode="Markdown"
             )
+            if sent_msg and hasattr(sent_msg, "message_id"):
+                update_job(job_id, {"status_message_id": sent_msg.message_id})
         else:
             await query.edit_message_text(
                 f"✅ Active destination folder set to: `{folder}`\n\nNow send any file or video to process and upload to this folder.",
@@ -1745,7 +1768,7 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
                 pending["folder"] = folder
                 job_id = create_job(pending)
                 context.user_data.pop("pending_file", None)
-                await msg.reply_text(
+                sent_msg = await msg.reply_text(
                     "🎬 *Job Queued Successfully*\n\n"
                     f"📄 *File:* `{pending['original_filename']}` ({format_size(pending['source_file_size'])})\n"
                     f"📁 *B2 Target Folder:* `{folder}`\n"
@@ -1753,6 +1776,8 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
                     "⏳ *Queued for MTProto worker processing...*",
                     parse_mode="Markdown"
                 )
+                if sent_msg and hasattr(sent_msg, "message_id"):
+                    update_job(job_id, {"status_message_id": sent_msg.message_id})
             else:
                 await msg.reply_text(f"✅ Active B2 destination folder created & set to: `{folder}`", parse_mode="Markdown")
         else:

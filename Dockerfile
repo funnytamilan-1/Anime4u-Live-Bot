@@ -12,8 +12,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application codebase
-COPY . .
+# Copy single-file bot
+COPY bot.py .
+
+# Health check port exposed
+EXPOSE 3000
 
 # Run bot
 CMD ["python", "bot.py"]

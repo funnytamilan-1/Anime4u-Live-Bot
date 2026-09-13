@@ -90,6 +90,12 @@ export const BotSimulator: React.FC<BotSimulatorProps> = ({
         processCommand('/newfolder');
       } else if (action === 'cmd_search') {
         processCommand('/search');
+      } else if (action === 'cmd_admin') {
+        processCommand('/admin');
+      } else if (action === 'cmd_admins') {
+        processCommand('/admins');
+      } else if (action === 'cmd_audit') {
+        processCommand('/audit');
       } else if (action === 'cmd_status') {
         addMessage(
           'bot',
@@ -131,8 +137,54 @@ export const BotSimulator: React.FC<BotSimulatorProps> = ({
             { text: '📤 Upload File', action: 'cmd_upload' },
             { text: '📁 New Folder', action: 'cmd_newfolder' },
           ],
+          [
+            { text: '👑 Admin Panel', action: 'cmd_admin' },
+            { text: '📋 Audit Logs', action: 'cmd_audit' },
+          ]
         ]
       );
+    } else if (lower === '/admin' || lower === '/adminpanel') {
+      addMessage(
+        'bot',
+        `👑 *Anime4u Admin Control Panel*\n\n` +
+          `⚙️ Active Storage Mode: \`TELEGRAM\`\n` +
+          `🛡️ Authorized Admins: \`${config.adminIds}\`\n` +
+          `📦 Total Storage Channel ID: \`${config.storageChannelId}\`\n\n` +
+          `• \`/admins\` - List authorized admin IDs\n` +
+          `• \`/addadmin <id>\` - Add admin user ID\n` +
+          `• \`/broadcast <msg>\` - Broadcast announcement\n` +
+          `• \`/audit\` - View security logs`,
+        [
+          [
+            { text: '🛡️ Admins List', action: 'cmd_admins' },
+            { text: '📋 Audit Logs', action: 'cmd_audit' },
+          ]
+        ]
+      );
+    } else if (lower === '/admins') {
+      addMessage(
+        'bot',
+        `🛡️ *Authorized Admin Users*:\n\n` +
+          config.adminIds.split(',').map((id) => `• \`${id.trim()}\``).join('\n')
+      );
+    } else if (lower.startsWith('/addadmin')) {
+      const parts = lower.split(' ');
+      const newId = parts[1] || '987654321';
+      addMessage('bot', `✅ Added user \`${newId}\` to authorized admin list!`);
+    } else if (lower.startsWith('/broadcast')) {
+      const msgText = lower.replace('/broadcast', '').trim() || 'System Maintenance Notice';
+      addMessage('bot', `📢 Broadcast announcement sent to all admins:\n\n"${msgText}"`);
+    } else if (lower === '/audit') {
+      addMessage(
+        'bot',
+        `📋 *Security & Audit Logs (Recent)*:\n\n` +
+          `• \`[2026-09-13 02:10]\` Admin \`${config.adminIds.split(',')[0]}\`: *upload* — file=Naruto_Ep1.mp4\n` +
+          `• \`[2026-09-13 02:05]\` Admin \`${config.adminIds.split(',')[0]}\`: *add_admin* — Added user 5192451273\n` +
+          `• \`[2026-09-13 01:50]\` Admin \`${config.adminIds.split(',')[0]}\`: *change_storage_mode* — mode=telegram`
+      );
+    } else if (lower.startsWith('/mode')) {
+      const m = lower.replace('/mode', '').trim() || 'telegram';
+      addMessage('bot', `✅ Global Storage Mode updated to \`${m.toUpperCase()}\`!`);
     } else if (lower === '/folders') {
       const folderButtons = folders.map((f) => [
         { text: `📁 ${f.name} (${f.fileCount})`, action: `select_folder:${f.path}` },
@@ -256,7 +308,7 @@ export const BotSimulator: React.FC<BotSimulatorProps> = ({
         {/* Command Quick Bar */}
         <div className="p-2 bg-slate-900 border-t border-slate-800/80 flex items-center space-x-2 overflow-x-auto text-xs font-mono text-slate-400">
           <span className="text-slate-500 px-2 shrink-0">Quick Commands:</span>
-          {['/start', '/folders', '/newfolder', '/selected', '/cancel', '/search'].map((cmd) => (
+          {['/start', '/admin', '/admins', '/audit', '/broadcast', '/mode', '/folders', '/newfolder', '/search', '/cancel'].map((cmd) => (
             <button
               key={cmd}
               onClick={() => processCommand(cmd)}

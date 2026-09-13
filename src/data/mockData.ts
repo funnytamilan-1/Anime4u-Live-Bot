@@ -1,12 +1,12 @@
 import { StreamItem, StorageFolder, AppConfig } from '../types';
 
 export const initialConfig: AppConfig = {
-  botToken: '',
-  adminIds: '123456789,987654321',
+  botToken: '8769661029:AAED5_SSFoU-Q_xQ_-p-x5FqzU7J9MZcIaE',
+  adminIds: '8525952693,5192451273',
   storageMode: 'telegram',
-  storageChannelId: '-1001234567890',
-  b2KeyId: '',
-  b2Key: '',
+  storageChannelId: '-1004364304959',
+  b2KeyId: '0054467fa469dc20000000002',
+  b2Key: 'K005ACvE5pP0RYQr4cplDYDSE96uMtA',
   b2Bucket: 'anime4u-videos',
   b2PublicBaseUrl: '',
   maxFileSize: 2147483648, // 2 GB

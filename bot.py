@@ -64,9 +64,9 @@ def start_health_check_server():
 # CONFIGURATION
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8769661029:AAED5_SSFoU-Q_xQ_-p-x5FqzU7J9MZcIaE").strip()
-STORAGE_CHANNEL_ID_RAW = os.getenv("STORAGE_CHANNEL_ID", "-1004364304959").strip()
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "5192451273").strip()
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "8769661029:AAED5_SSFoU-Q_xQ_-p-x5FqzU7J9MZcIaE").strip()
+STORAGE_CHANNEL_ID_RAW = (os.getenv("STORAGE_CHANNEL_ID") or "-1004364304959").strip()
+ADMIN_IDS_RAW = (os.getenv("ADMIN_IDS") or "8525952693,5192451273").strip()
 
 try:
     STORAGE_CHANNEL_ID = int(STORAGE_CHANNEL_ID_RAW) if STORAGE_CHANNEL_ID_RAW else 0
@@ -77,7 +77,7 @@ except ValueError:
 ADMIN_IDS = {
     int(x.strip())
     for x in ADMIN_IDS_RAW.split(",")
-    if x.strip().replace("5192451273", "").isdigit()
+    if x.strip().lstrip("-").isdigit()
 }
 
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 2147483648))  # 2 GB
@@ -200,9 +200,190 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/storage - Real health check (Telegram API, B2, DB, FFmpeg)\n"
         "/recent - View 10 most recent uploads\n"
         "/reconcile - Run reconciliation audit (B2 vs Telegram vs DB)\n"
+        "/admin - Admin Control Panel\n"
+        "/admins - List authorized admin user IDs\n"
+        "/addadmin <id> - Add new authorized admin user\n"
+        "/removeadmin <id> - Remove authorized admin user\n"
+        "/broadcast <text> - Send announcement to all admins\n"
+        "/audit - View security & admin audit log history\n"
+        "/mode <telegram|b2|both> - Switch storage engine mode\n"
         "/cancel - Cancel active input prompt"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
+
+async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await deny(update)
+        return
+
+    admin_count = len(ADMIN_IDS)
+    curr_mode = storage_manager.global_mode.upper()
+    stats = database.get_stats()
+
+    text = (
+        "👑 *Anime4u Admin Control Panel*\n\n"
+        f"⚙️ *Active Storage Mode:* `{curr_mode}`\n"
+        f"🛡️ *Authorized Admins:* `{admin_count}`\n"
+        f"📦 *Total Stored Files:* `{stats['total_files']}` ({stats['readable_bytes']})\n"
+        f"📁 *Virtual Folders:* `{stats['total_folders']}`\n"
+        f"🌐 *Health Check Port:* `{os.getenv('PORT', '3000')}`\n\n"
+        "Commands:\n"
+        "• `/mode <telegram|b2|both>` - Switch mode\n"
+        "• `/admins` - List admin IDs\n"
+        "• `/addadmin <id>` - Add new admin\n"
+        "• `/removeadmin <id>` - Remove admin\n"
+        "• `/broadcast <text>` - Send announcement\n"
+        "• `/audit` - Security audit logs"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚙️ Mode: Telegram", callback_data="admin_set_mode_telegram"),
+            InlineKeyboardButton("⚙️ Mode: B2", callback_data="admin_set_mode_b2"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Mode: Dual Both", callback_data="admin_set_mode_both"),
+            InlineKeyboardButton("📊 Stats", callback_data="cmd_stats"),
+        ],
+        [
+            InlineKeyboardButton("🛡️ Admins List", callback_data="admin_list"),
+            InlineKeyboardButton("📋 Audit Logs", callback_data="admin_audit"),
+        ],
+        [
+            InlineKeyboardButton("📢 Broadcast Prompt", callback_data="admin_broadcast_prompt"),
+            InlineKeyboardButton("🔄 Reconcile DB", callback_data="cmd_reconcile"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Main Menu", callback_data="start_menu")
+        ]
+    ])
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await deny(update)
+        return
+
+    admin_list_str = "\n".join([f"• `{aid}`" for aid in sorted(ADMIN_IDS)])
+    text = f"🛡️ *Authorized Admin Users* ({len(ADMIN_IDS)}):\n\n{admin_list_str}\n\nUse `/addadmin <user_id>` or `/removeadmin <user_id>` to modify access."
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown")
+
+async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await deny(update)
+        return
+
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/addadmin <user_id>`", parse_mode="Markdown")
+        return
+
+    try:
+        new_admin = int(context.args[0].strip())
+        ADMIN_IDS.add(new_admin)
+        database.log_audit(update.effective_user.id, "add_admin", f"Added user {new_admin}")
+        await update.message.reply_text(f"✅ Added user `{new_admin}` to authorized admin set!", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ User ID must be a valid integer.")
+
+async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await deny(update)
+        return
+
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/removeadmin <user_id>`", parse_mode="Markdown")
+        return
+
+    try:
+        target_admin = int(context.args[0].strip())
+        if target_admin in ADMIN_IDS:
+            if len(ADMIN_IDS) <= 1:
+                await update.message.reply_text("❌ Cannot remove the last remaining admin.")
+                return
+            ADMIN_IDS.remove(target_admin)
+            database.log_audit(update.effective_user.id, "remove_admin", f"Removed user {target_admin}")
+            await update.message.reply_text(f"✅ Removed user `{target_admin}` from authorized admin set.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"⚠️ User `{target_admin}` is not currently an admin.", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ User ID must be a valid integer.")
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await deny(update)
+        return
+
+    if not context.args:
+        context.user_data["waiting_for_broadcast"] = True
+        await update.message.reply_text("📢 Send the announcement message to broadcast to all admins.")
+        return
+
+    broadcast_text = " ".join(context.args)
+    sender_id = update.effective_user.id
+    success_count = 0
+
+    for aid in list(ADMIN_IDS):
+        try:
+            await context.bot.send_message(
+                chat_id=aid,
+                text=f"📢 *ADMIN ANNOUNCEMENT*\nFrom: `{sender_id}`\n\n{broadcast_text}",
+                parse_mode="Markdown"
+            )
+            success_count += 1
+        except Exception as e:
+            logger.warning(f"Could not deliver broadcast to {aid}: {e}")
+
+    database.log_audit(sender_id, "broadcast", broadcast_text[:100])
+    await update.message.reply_text(f"✅ Broadcast sent to `{success_count}` admin(s).", parse_mode="Markdown")
+
+async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await deny(update)
+        return
+
+    logs = database.get_recent_audit_logs(15)
+    if not logs:
+        text = "📋 No audit log events recorded yet."
+    else:
+        lines = []
+        for l in logs:
+            dt = l.get("created_at", "")[:19].replace("T", " ")
+            lines.append(f"• `[{dt}]` Admin `{l['admin_id']}`: *{l['action']}* — {l['details']}")
+        text = "📋 *Security & Admin Audit Logs* (Recent 15):\n\n" + "\n".join(lines)
+
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Admin Panel", callback_data="admin_panel")]])
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await deny(update)
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            f"⚙️ Active Storage Mode: `{storage_manager.global_mode.upper()}`\n\nUsage: `/mode <telegram|b2|both>`",
+            parse_mode="Markdown"
+        )
+        return
+
+    new_m = context.args[0].lower().strip()
+    if storage_manager.set_global_mode(new_m):
+        database.log_audit(update.effective_user.id, "change_storage_mode", new_m)
+        await update.message.reply_text(f"✅ Storage Mode updated to `{new_m.upper()}`!", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Invalid mode. Valid choices: `telegram`, `b2`, `both`", parse_mode="Markdown")
 
 async def folders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -458,6 +639,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_data = context.user_data
 
+    # Broadcast message input
+    if user_data.get("waiting_for_broadcast"):
+        b_text = update.message.text.strip()
+        user_data.pop("waiting_for_broadcast", None)
+        context.args = b_text.split()
+        await broadcast_command(update, context)
+        return
+
     # New folder prompt input
     if user_data.get("waiting_for_folder_name"):
         folder_raw = update.message.text.strip().strip("/")
@@ -628,6 +817,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "start_menu":
         await start(update, context)
+
+    elif data == "admin_panel":
+        await admin_panel_command(update, context)
+
+    elif data == "admin_list":
+        await list_admins_command(update, context)
+
+    elif data == "admin_audit":
+        await audit_command(update, context)
+
+    elif data == "admin_broadcast_prompt":
+        context.user_data["waiting_for_broadcast"] = True
+        await query.edit_message_text("📢 Send the announcement text to broadcast to all admins.")
+
+    elif data == "admin_set_mode_telegram":
+        storage_manager.set_global_mode("telegram")
+        database.log_audit(user_id, "change_storage_mode", "telegram")
+        await admin_panel_command(update, context)
+
+    elif data == "admin_set_mode_b2":
+        storage_manager.set_global_mode("b2")
+        database.log_audit(user_id, "change_storage_mode", "b2")
+        await admin_panel_command(update, context)
+
+    elif data == "admin_set_mode_both":
+        storage_manager.set_global_mode("both")
+        database.log_audit(user_id, "change_storage_mode", "both")
+        await admin_panel_command(update, context)
 
     elif data == "cmd_folders":
         await folders_command(update, context)
@@ -867,6 +1084,14 @@ def main():
     app.add_handler(CommandHandler("recent", recent_command))
     app.add_handler(CommandHandler("reconcile", reconcile_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("admin", admin_panel_command))
+    app.add_handler(CommandHandler("adminpanel", admin_panel_command))
+    app.add_handler(CommandHandler("admins", list_admins_command))
+    app.add_handler(CommandHandler("addadmin", add_admin_command))
+    app.add_handler(CommandHandler("removeadmin", remove_admin_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("audit", audit_command))
+    app.add_handler(CommandHandler("mode", mode_command))
 
     # Callback Query
     app.add_handler(CallbackQueryHandler(callback_handler))

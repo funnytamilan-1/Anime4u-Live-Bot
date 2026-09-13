@@ -74,7 +74,7 @@ API_ID: Optional[int] = None
 if API_ID_RAW and API_ID_RAW.isdigit():
     API_ID = int(API_ID_RAW)
 
-SERVICE_MODE = (os.getenv("SERVICE_MODE") or "worker").strip().lower()  # 'render', 'worker', or 'all'
+SERVICE_MODE = (os.getenv("SERVICE_MODE") or "all").strip().lower()  # 'render', 'worker', or 'all'
 
 ADMIN_IDS_RAW = _get_env("ADMIN_IDS", "5192451273, 8525952693")
 ADMIN_IDS: Set[int] = set()

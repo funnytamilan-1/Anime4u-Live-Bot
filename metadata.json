@@ -1,0 +1,6 @@
+{
+  "name": "B2 Telegram Storage Bot",
+  "description": "Telegram file-storage and Backblaze B2 media processing bot with MTProto large file support",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

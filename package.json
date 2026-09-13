@@ -1,0 +1,11 @@
+{
+  "name": "b2-telegram-media-bot",
+  "version": "1.0.0",
+  "description": "Telegram file-storage and Backblaze B2 media processing bot with MTProto support",
+  "main": "bot.py",
+  "scripts": {
+    "dev": "python3 bot.py",
+    "start": "python3 bot.py",
+    "build": "echo 'Build successful'"
+  }
+}

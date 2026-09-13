@@ -50,8 +50,8 @@ except ImportError:
 # ============================================================
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "8769661029:AAED5_SSFoU-Q_xQ_-p-x5FqzU7J9MZcIaE").strip()
-API_ID_RAW = (os.getenv("API_ID") or "").strip()
-API_HASH = (os.getenv("API_HASH") or "").strip()
+API_ID_RAW = (os.getenv("API_ID") or "27806628").strip()
+API_HASH = (os.getenv("API_HASH") or "25d88301e886b82826a525b7cf52e090").strip()
 TELEGRAM_SESSION_STRING = (os.getenv("TELEGRAM_SESSION_STRING") or "").strip()
 
 API_ID: Optional[int] = None

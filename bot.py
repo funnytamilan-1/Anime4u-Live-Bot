@@ -11,6 +11,7 @@ import re
 import json
 import time
 import signal
+import enum
 import traceback
 import logging
 import asyncio
@@ -982,6 +983,10 @@ async def get_telethon_client() -> Optional[Any]:
     if not TELETHON_AVAILABLE:
         return None
 
+    if 'worker_lifecycle' in globals() and worker_lifecycle.is_shutting_down():
+        logger.info("[MTPROTO] Shutdown in progress; skipping Telethon connection.")
+        return None
+
     if telethon_client and telethon_client.is_connected():
         return telethon_client
 
@@ -1004,6 +1009,16 @@ async def get_telethon_client() -> Optional[Any]:
             session = StringSession()
             telethon_client = TelegramClient(session, API_ID, API_HASH)
             await telethon_client.start(bot_token=BOT_TOKEN)
+
+        if 'worker_lifecycle' in globals() and worker_lifecycle.is_shutting_down():
+            logger.info("[MTPROTO] Shutdown requested during Telethon startup; disconnecting immediately.")
+            try:
+                if telethon_client.is_connected():
+                    await telethon_client.disconnect()
+            except Exception:
+                pass
+            telethon_client = None
+            return None
 
         logger.info("[MTPROTO] Persistent Telethon MTProto client connected & authorized successfully!")
         return telethon_client
@@ -1115,8 +1130,242 @@ async def setup_telethon_session_cli():
 # 6. VPS MTPROTO WORKER ENGINE (ASYNC JOB PROCESSOR)
 # ============================================================
 
+class WorkerState(enum.Enum):
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    STOPPING = "STOPPING"
+    STOPPED = "STOPPED"
+
 worker_running = False
 worker_lock = asyncio.Lock()
+
+class WorkerLifecycleManager:
+    """Authoritative singleton lifecycle manager for the Railway/VPS worker service."""
+    def __init__(self):
+        self.state: WorkerState = WorkerState.STARTING
+        self.shutdown_event = asyncio.Event()
+        self._shutdown_lock = asyncio.Lock()
+        self.worker_task: Optional[asyncio.Task] = None
+        self.telethon_task: Optional[asyncio.Task] = None
+        self.bot_instance: Optional[Any] = None
+        self.start_time = time.time()
+
+    def is_shutting_down(self) -> bool:
+        return self.state in (WorkerState.STOPPING, WorkerState.STOPPED) or self.shutdown_event.is_set()
+
+    def request_shutdown(self, signal_name: str = "SIGTERM"):
+        """Synchronous signal handler callback - idempotent and immediate."""
+        logger.info(f"[PROCESS] {signal_name} received")
+        logger.info(f"[WORKER] Shutdown signal received ({signal_name})")
+        if self.state in (WorkerState.STOPPING, WorkerState.STOPPED):
+            logger.info("[PROCESS] Shutdown already in progress (idempotent signal ignored)")
+            return
+
+        self.state = WorkerState.STOPPING
+        logger.info("[PROCESS] Lifecycle state: STOPPING")
+        logger.info("[PROCESS] No further startup allowed")
+        self.shutdown_event.set()
+
+        global worker_running
+        worker_running = False
+
+        # If a telethon connection task is in progress, cancel it immediately
+        if self.telethon_task and not self.telethon_task.done():
+            self.telethon_task.cancel()
+
+        # If worker queue task is active, cancel it immediately
+        if self.worker_task and not self.worker_task.done():
+            self.worker_task.cancel()
+
+    async def run(self):
+        """The single authoritative worker lifecycle runner."""
+        start_iso = datetime.now(timezone.utc).isoformat()
+        logger.info(f"[PROCESS] Main lifecycle entered (PID: {os.getpid()}, Start time: {start_iso}, Mode: {SERVICE_MODE})")
+        logger.info("[WORKER] Starting worker lifecycle")
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig.name: self.request_shutdown(s))
+            except (NotImplementedError, AttributeError):
+                signal.signal(sig, lambda s, f, s_name=sig.name: self.request_shutdown(s_name))
+
+        if self.is_shutting_down():
+            await self._cleanup()
+            return
+
+        # 1. Stale Job Recovery
+        try:
+            rec = recover_stale_jobs(stale_timeout_sec=600)
+            if rec > 0:
+                logger.info(f"[WORKER] Stale job recovery initialized: {rec} job(s) reset to QUEUED.")
+        except Exception as e:
+            logger.warning(f"[WORKER] Stale job recovery note: {e}")
+
+        if self.is_shutting_down():
+            await self._cleanup()
+            return
+
+        # 2. Run Startup Diagnostics
+        try:
+            await run_worker_diagnostics()
+        except Exception as err:
+            logger.warning(f"[DIAGNOSTICS] Diagnostic check warning: {err}")
+
+        if self.is_shutting_down():
+            await self._cleanup()
+            return
+
+        # 3. Connect Persistent Telethon (guarded against SIGTERM during connect)
+        logger.info("[WORKER] Connecting Telethon")
+        try:
+            self.telethon_task = asyncio.create_task(get_telethon_client())
+            client = await self.telethon_task
+            if client:
+                logger.info("[WORKER] Telethon connected")
+            else:
+                logger.warning("[WORKER] Persistent Telethon client not available. Worker running in fallback mode.")
+        except asyncio.CancelledError:
+            logger.info("[WORKER] Telethon connection cancelled by shutdown signal.")
+        except Exception as e:
+            logger.warning(f"[WORKER] Error connecting Telethon: {e}")
+        finally:
+            self.telethon_task = None
+
+        if self.is_shutting_down():
+            await self._cleanup()
+            return
+
+        # 4. Initialize Standalone Bot Client for notifications only (no polling)
+        if BOT_TOKEN:
+            try:
+                import telegram
+                self.bot_instance = telegram.Bot(token=BOT_TOKEN)
+                await self.bot_instance.initialize()
+            except Exception as e:
+                logger.warning(f"[WORKER] Standalone bot instance initialization note: {e}")
+
+        if self.is_shutting_down():
+            await self._cleanup()
+            return
+
+        # 5. Transition to RUNNING and start Queue Consumer
+        self.state = WorkerState.RUNNING
+        global worker_running
+        worker_running = True
+        logger.info("[WORKER] Starting queue consumer")
+        logger.info("[WORKER] Worker loop ACTIVE")
+        logger.info("[WORKER] Waiting for jobs...")
+        self.worker_task = asyncio.create_task(self._worker_loop_core())
+        logger.info("[PROCESS] Main lifecycle waiting")
+
+        # 6. Wait for Shutdown Event
+        try:
+            await self.shutdown_event.wait()
+        except asyncio.CancelledError:
+            logger.info("[PROCESS] Main lifecycle received CancelledError.")
+
+        # 7. Execute Cleanup
+        await self._cleanup()
+
+    async def _worker_loop_core(self):
+        last_waiting_log = 0.0
+        consecutive_errors = 0
+
+        while self.state == WorkerState.RUNNING and not self.shutdown_event.is_set():
+            try:
+                job = claim_next_queued_job()
+                if not job:
+                    now = time.time()
+                    if now - last_waiting_log > 300.0:
+                        last_waiting_log = now
+                        logger.info("[WORKER] Waiting for jobs... (worker active and queue healthy)")
+
+                    try:
+                        await asyncio.sleep(2.0)
+                    except asyncio.CancelledError:
+                        break
+                    consecutive_errors = 0
+                    continue
+
+                if self.is_shutting_down():
+                    job_id = job.get("job_id")
+                    if job_id:
+                        update_job(job_id, {"status": "QUEUED", "progress_stage": "QUEUED"})
+                    break
+
+                consecutive_errors = 0
+                job_id = job["job_id"]
+                orig_name = job.get("original_filename", "unknown")
+                logger.info(f"[WORKER] Processing job {job_id} ({orig_name})...")
+                async with worker_lock:
+                    await process_single_job(job, ptb_app=None, direct_bot=self.bot_instance)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"[WORKER] Unhandled exception in worker loop: {e}\n{traceback.format_exc()}")
+                backoff_sec = min(30.0, 2.0 * consecutive_errors)
+                logger.info(f"[WORKER] Backing off worker loop for {backoff_sec:.1f}s before retrying...")
+                try:
+                    await asyncio.sleep(backoff_sec)
+                except asyncio.CancelledError:
+                    break
+
+        logger.info("[WORKER] Stopping queue consumer")
+        logger.info("[WORKER] Worker loop stopped")
+        logger.info("[PROCESS] Queue consumer stopped")
+
+    async def _cleanup(self):
+        """Authoritative teardown routine - executed once."""
+        async with self._shutdown_lock:
+            if self.state == WorkerState.STOPPED:
+                return
+            self.state = WorkerState.STOPPING
+
+            global worker_running
+            worker_running = False
+
+            # Stop and await worker task
+            if self.worker_task and not self.worker_task.done():
+                self.worker_task.cancel()
+                try:
+                    await self.worker_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"[WORKER] Error awaiting worker task: {e}")
+                self.worker_task = None
+
+            # Disconnect Persistent Telethon
+            global telethon_client
+            if telethon_client:
+                logger.info("[WORKER] Disconnecting Telethon")
+                try:
+                    if telethon_client.is_connected():
+                        await telethon_client.disconnect()
+                    logger.info("[WORKER] Telethon disconnected")
+                    logger.info("[PROCESS] Telethon disconnected")
+                except Exception as e:
+                    logger.warning(f"[WORKER] Error disconnecting Telethon: {e}")
+                finally:
+                    telethon_client = None
+
+            # Close Standalone Bot Client
+            if self.bot_instance:
+                try:
+                    await self.bot_instance.shutdown()
+                except Exception:
+                    pass
+                self.bot_instance = None
+
+            logger.info("[WORKER] Shutdown complete")
+            self.state = WorkerState.STOPPED
+            logger.info("[PROCESS] Lifecycle state: STOPPED")
+            logger.info("[PROCESS] Main lifecycle exiting (Exit code: 0)")
+
+worker_lifecycle = WorkerLifecycleManager()
 
 async def run_worker_diagnostics():
     """Perform real startup diagnostics for worker dependencies."""
@@ -1160,158 +1409,14 @@ async def run_worker_diagnostics():
     except Exception as exc:
         logger.warning(f"[DIAGNOSTICS] Diagnostics warning: {exc}")
 
-async def run_worker_loop_core(bot_instance: Optional[Any] = None, shutdown_event: Optional[asyncio.Event] = None):
-    """Core long-running worker processing loop."""
-    global worker_running
-    worker_running = True
-    logger.info("[WORKER] Starting queue consumer")
-    logger.info("[WORKER] Worker loop ACTIVE")
-    logger.info("[WORKER] Waiting for jobs...")
-
-    last_waiting_log = 0.0
-    consecutive_errors = 0
-
-    while worker_running and (shutdown_event is None or not shutdown_event.is_set()):
-        try:
-            job = claim_next_queued_job()
-            if not job:
-                now = time.time()
-                if now - last_waiting_log > 300.0:
-                    last_waiting_log = now
-                    logger.info("[WORKER] Waiting for jobs... (worker active and queue healthy)")
-
-                try:
-                    await asyncio.sleep(2.0)
-                except asyncio.CancelledError:
-                    break
-                consecutive_errors = 0
-                continue
-
-            consecutive_errors = 0
-            job_id = job["job_id"]
-            orig_name = job.get("original_filename", "unknown")
-            logger.info(f"[WORKER] Processing job {job_id} ({orig_name})...")
-            async with worker_lock:
-                await process_single_job(job, ptb_app=None, direct_bot=bot_instance)
-
-        except asyncio.CancelledError:
-            logger.info("[WORKER] Worker loop cancelled.")
-            break
-        except Exception as e:
-            consecutive_errors += 1
-            logger.error(f"[WORKER] Unhandled exception in worker loop: {e}\n{traceback.format_exc()}")
-            backoff_sec = min(30.0, 2.0 * consecutive_errors)
-            logger.info(f"[WORKER] Backing off worker loop for {backoff_sec:.1f}s before retrying...")
-            try:
-                await asyncio.sleep(backoff_sec)
-            except asyncio.CancelledError:
-                break
-
-    logger.info("[WORKER] Stopping queue consumer")
-
 async def run_worker_lifecycle():
-    """Manages the full lifecycle of the worker node including graceful signal shutdown."""
-    start_time_iso = datetime.now(timezone.utc).isoformat()
-    logger.info(f"[PROCESS] Main lifecycle entered (PID: {os.getpid()}, Start time: {start_time_iso}, Mode: {SERVICE_MODE})")
-    logger.info("[WORKER] Starting worker lifecycle")
-
-    shutdown_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-
-    def handle_signal(sig_name: str):
-        logger.info(f"[PROCESS] {sig_name} received")
-        logger.info(f"[WORKER] Shutdown signal received ({sig_name})")
-        shutdown_event.set()
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, lambda s=sig.name: handle_signal(s))
-        except (NotImplementedError, AttributeError):
-            signal.signal(sig, lambda s, f, s_name=sig.name: handle_signal(s_name))
-
-    # Recover any stale jobs from previous restarts
-    recovered_jobs = recover_stale_jobs(stale_timeout_sec=600)
-    if recovered_jobs > 0:
-        logger.info(f"[WORKER] Stale job recovery initialized: {recovered_jobs} job(s) reset to QUEUED.")
-
-    try:
-        await run_worker_diagnostics()
-    except Exception as err:
-        logger.warning(f"[DIAGNOSTICS] Diagnostic check warning: {err}")
-
-    if shutdown_event.is_set():
-        logger.info("[WORKER] Shutdown requested during startup.")
-        return
-
-    logger.info("[WORKER] Connecting Telethon")
-    client = await get_telethon_client()
-    if client:
-        logger.info("[WORKER] Telethon connected")
-    else:
-        logger.warning("[WORKER] Persistent Telethon client not available. Worker running in fallback mode.")
-
-    if shutdown_event.is_set():
-        logger.info("[WORKER] Shutdown requested after telethon init.")
-        if telethon_client:
-            try:
-                if telethon_client.is_connected():
-                    await telethon_client.disconnect()
-            except Exception:
-                pass
-        return
-
-    bot_instance = None
-    if BOT_TOKEN:
-        try:
-            import telegram
-            bot_instance = telegram.Bot(token=BOT_TOKEN)
-            await bot_instance.initialize()
-        except Exception as e:
-            logger.warning(f"[WORKER] Standalone bot instance initialization note: {e}")
-
-    worker_task = asyncio.create_task(run_worker_loop_core(bot_instance=bot_instance, shutdown_event=shutdown_event))
-    logger.info("[PROCESS] Main lifecycle waiting")
-
-    # Keep worker process alive awaiting shutdown signal or task termination
-    try:
-        await shutdown_event.wait()
-    except asyncio.CancelledError:
-        logger.info("[PROCESS] Main lifecycle cancelled.")
-
-    # Graceful shutdown sequence
-    global worker_running
-    worker_running = False
-
-    if not worker_task.done():
-        worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"[WORKER] Error awaiting worker task during shutdown: {e}")
-
-    if telethon_client:
-        logger.info("[WORKER] Disconnecting Telethon")
-        try:
-            if telethon_client.is_connected():
-                await telethon_client.disconnect()
-            logger.info("[WORKER] Telethon disconnected")
-        except Exception as e:
-            logger.warning(f"[WORKER] Error disconnecting Telethon: {e}")
-
-    if bot_instance:
-        try:
-            await bot_instance.shutdown()
-        except Exception:
-            pass
-
-    logger.info("[WORKER] Shutdown complete")
-    logger.info("[PROCESS] Main lifecycle exiting (Exit code: 0)")
+    """Entry point for worker lifecycle delegated to the authoritative manager."""
+    await worker_lifecycle.run()
 
 async def run_worker_loop(ptb_app: Optional[Application] = None):
+    """Legacy helper if called within unified mode."""
     bot_client = ptb_app.bot if ptb_app else None
-    await run_worker_loop_core(bot_instance=bot_client)
+    await worker_lifecycle._worker_loop_core()
 
 async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application] = None, direct_bot: Optional[Any] = None):
     t_job_claimed = time.time()
@@ -1894,11 +1999,14 @@ class HealthHandler(BaseHTTPRequestHandler):
         except Exception:
             queue_status = "accessible"
 
+        worker_state_str = worker_lifecycle.state.value if 'worker_lifecycle' in globals() else ("RUNNING" if worker_running else "IDLE")
+
         payload = {
             "status": "ok",
             "service": "b2-telegram-storage-bot",
             "service_mode": SERVICE_MODE,
-            "worker": "active" if worker_running else "idle",
+            "worker": "active" if worker_state_str == "RUNNING" else worker_state_str.lower(),
+            "worker_state": worker_state_str,
             "telethon": telethon_status,
             "queue": queue_status,
             "pid": os.getpid(),

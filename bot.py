@@ -43,9 +43,16 @@ try:
     import telethon
     from telethon import TelegramClient
     from telethon.sessions import StringSession
+    from telethon.errors import FloodWaitError, FloodError, RPCError
     TELETHON_AVAILABLE = True
 except ImportError:
     TELETHON_AVAILABLE = False
+    telethon = None
+    TelegramClient = None
+    StringSession = None
+    FloodWaitError = Exception
+    FloodError = Exception
+    RPCError = Exception
     logger.warning("Telethon library is not installed. MTProto large file downloading will be unavailable.")
 
 # ============================================================
@@ -140,8 +147,9 @@ from telegram.ext import (
     filters,
 )
 
-# Global Telethon Client Reference
+# Global Telethon Client Reference & FloodWait Tracker
 telethon_client: Optional[Any] = None
+telethon_flood_wait_until: float = 0.0
 
 # Optional Supabase Database integration
 supabase_client = None
@@ -979,7 +987,7 @@ async def process_video_for_web(
 # ============================================================
 
 async def get_telethon_client() -> Optional[Any]:
-    global telethon_client
+    global telethon_client, telethon_flood_wait_until
     if not TELETHON_AVAILABLE:
         return None
 
@@ -994,6 +1002,14 @@ async def get_telethon_client() -> Optional[Any]:
         logger.warning("[MTPROTO] API_ID or API_HASH missing. Telethon MTProto client cannot start.")
         return None
 
+    now = time.time()
+    if now < telethon_flood_wait_until:
+        remaining_sec = int(telethon_flood_wait_until - now)
+        logger.warning(
+            f"[MTPROTO] Telegram FloodWait cooldown active ({remaining_sec}s remaining). Skipping connection to respect rate limits."
+        )
+        return None
+
     try:
         if TELEGRAM_SESSION_STRING:
             logger.info("[MTPROTO] Initializing persistent Telethon client with TELEGRAM_SESSION_STRING...")
@@ -1005,10 +1021,15 @@ async def get_telethon_client() -> Optional[Any]:
                 telethon_client = None
                 return None
         else:
-            logger.info("[MTPROTO] Initializing persistent Telethon client with Bot Token...")
-            session = StringSession()
-            telethon_client = TelegramClient(session, API_ID, API_HASH)
-            await telethon_client.start(bot_token=BOT_TOKEN)
+            session_file = str(Path(DB_PATH).parent / "telethon_worker")
+            logger.info(f"[MTPROTO] Initializing persistent Telethon client with disk session ({session_file}.session)...")
+            telethon_client = TelegramClient(session_file, API_ID, API_HASH)
+            await telethon_client.connect()
+            if not await telethon_client.is_user_authorized():
+                logger.info("[MTPROTO] Authorizing Telethon client with Bot Token...")
+                await telethon_client.start(bot_token=BOT_TOKEN)
+            else:
+                logger.info("[MTPROTO] Existing disk session loaded & authorized (no new authorization request needed).")
 
         if 'worker_lifecycle' in globals() and worker_lifecycle.is_shutting_down():
             logger.info("[MTPROTO] Shutdown requested during Telethon startup; disconnecting immediately.")
@@ -1022,8 +1043,42 @@ async def get_telethon_client() -> Optional[Any]:
 
         logger.info("[MTPROTO] Persistent Telethon MTProto client connected & authorized successfully!")
         return telethon_client
+    except FloodWaitError as fwe:
+        telethon_flood_wait_until = time.time() + fwe.seconds
+        logger.warning(
+            f"[MTPROTO] Telegram FloodWaitError: Telegram API rate limit requires waiting {fwe.seconds}s before authorizing a new bot MTProto session "
+            f"(caused by {getattr(fwe, 'request', 'ImportBotAuthorizationRequest')}). "
+            f"Worker will continue running in fallback mode until cooldown expires. "
+            f"Tip: Set TELEGRAM_SESSION_STRING in environment variables for instant persistent authorization."
+        )
+        if telethon_client:
+            try:
+                if telethon_client.is_connected():
+                    await telethon_client.disconnect()
+            except Exception:
+                pass
+        telethon_client = None
+        return None
     except Exception as e:
-        logger.error(f"[MTPROTO] Failed to initialize persistent Telethon client: {e}")
+        err_msg = str(e)
+        if "wait of" in err_msg.lower() or "flood" in err_msg.lower():
+            import re
+            match = re.search(r"(\d+)\s+seconds", err_msg)
+            sec = int(match.group(1)) if match else 300
+            telethon_flood_wait_until = time.time() + sec
+            logger.warning(
+                f"[MTPROTO] Telegram authorization rate limit: {err_msg}. "
+                f"Worker will continue running in fallback mode for {sec}s. "
+                f"Tip: Set TELEGRAM_SESSION_STRING in environment variables to bypass bot login rate limits."
+            )
+        else:
+            logger.error(f"[MTPROTO] Failed to initialize persistent Telethon client: {e}")
+        if telethon_client:
+            try:
+                if telethon_client.is_connected():
+                    await telethon_client.disconnect()
+            except Exception:
+                pass
         telethon_client = None
         return None
 
@@ -1035,6 +1090,13 @@ async def download_telegram_file_mtproto(
 ) -> bool:
     client = await get_telethon_client()
     if not client:
+        now = time.time()
+        if now < telethon_flood_wait_until:
+            rem = int(telethon_flood_wait_until - now)
+            raise RuntimeError(
+                f"MTProto client rate limited by Telegram ({rem}s cooldown remaining). "
+                f"Set TELEGRAM_SESSION_STRING in environment variables for instant persistent authentication."
+            )
         raise RuntimeError("MTProto client is not configured or unavailable. Set API_ID and API_HASH.")
 
     logger.info(f"[WORKER] Download starting for chat_id={chat_id}, message_id={message_id}")
@@ -1985,6 +2047,8 @@ class HealthHandler(BaseHTTPRequestHandler):
         if API_ID and API_HASH and TELETHON_AVAILABLE:
             if telethon_client and telethon_client.is_connected():
                 telethon_status = "connected"
+            elif telethon_flood_wait_until > time.time():
+                telethon_status = f"rate_limited ({int(telethon_flood_wait_until - time.time())}s cooldown)"
             else:
                 telethon_status = "configured_idle"
 

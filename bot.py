@@ -828,6 +828,46 @@ async def setup_telethon_session_cli():
 worker_running = False
 worker_lock = asyncio.Lock()
 
+async def run_worker_diagnostics():
+    """Perform real startup diagnostics for worker dependencies."""
+    logger.info("[DIAGNOSTICS] Running MTProto worker startup diagnostics...")
+    try:
+        mtproto_ok = bool(API_ID and API_HASH and TELETHON_AVAILABLE)
+        logger.info(f"[DIAGNOSTICS] MTProto Client Config: {'✅ Configured' if mtproto_ok else '⚠️ Missing credentials or Telethon'}")
+
+        try:
+            conn = get_sqlite_conn()
+            conn.execute("SELECT 1")
+            conn.close()
+            db_ok = True
+        except Exception as e:
+            db_ok = False
+            logger.error(f"[DIAGNOSTICS] Database check error: {e}")
+        logger.info(f"[DIAGNOSTICS] Database Connection: {'✅ OK' if db_ok else '❌ Error'}")
+
+        b2_ok, b2_msg = b2_storage.check_health()
+        logger.info(f"[DIAGNOSTICS] B2 Storage Health: {'✅ OK' if b2_ok else f'❌ {b2_msg}'}")
+
+        ffmpeg_ok, ffprobe_ok = check_ffmpeg_installed()
+        logger.info(f"[DIAGNOSTICS] FFmpeg Binary: {'✅ Present' if ffmpeg_ok else '❌ Missing'}")
+        logger.info(f"[DIAGNOSTICS] FFprobe Binary: {'✅ Present' if ffprobe_ok else '❌ Missing'}")
+
+        space_ok, space_msg = check_disk_space()
+        logger.info(f"[DIAGNOSTICS] Disk Space: {'✅ OK' if space_ok else f'⚠️ {space_msg}'}")
+
+        try:
+            conn = get_sqlite_conn()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM jobs WHERE status = 'QUEUED'")
+            q_cnt = cursor.fetchone()[0]
+            conn.close()
+            logger.info(f"[DIAGNOSTICS] Job Queue Status: ✅ {q_cnt} job(s) queued")
+        except Exception as e:
+            logger.error(f"[DIAGNOSTICS] Queue status check error: {e}")
+
+    except Exception as exc:
+        logger.warning(f"[DIAGNOSTICS] Diagnostics warning: {exc}")
+
 async def run_worker_loop(ptb_app: Optional[Application] = None):
     global worker_running
     worker_running = True
@@ -2013,11 +2053,31 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_incoming_message))
 
-    # Clean Mode-based Execution
+    # Mode Startup Logging
+    if SERVICE_MODE == "bot":
+        logger.info("[STARTUP] SERVICE_MODE=bot")
+        logger.info("[STARTUP] Telegram polling enabled")
+        logger.info("[STARTUP] MTProto worker disabled")
+    elif SERVICE_MODE == "worker":
+        logger.info("[STARTUP] SERVICE_MODE=worker")
+        logger.info("[STARTUP] Telegram polling disabled")
+        logger.info("[STARTUP] MTProto worker enabled")
+    elif SERVICE_MODE == "all":
+        logger.info("[STARTUP] SERVICE_MODE=all")
+        logger.info("[STARTUP] Bot polling enabled")
+        logger.info("[STARTUP] MTProto worker enabled (single process ownership)")
+
+    async def safe_run_diagnostics():
+        try:
+            await run_worker_diagnostics()
+        except Exception as err:
+            logger.warning(f"[DIAGNOSTICS] Diagnostic check failed gracefully: {err}")
+
+    # Mode-based Execution
     if SERVICE_MODE == "worker":
         logger.info("[SERVICE_MODE] Running in WORKER mode. Telegram Bot API polling is DISABLED.")
         async def main_worker():
-            await run_worker_diagnostics()
+            await safe_run_diagnostics()
             await get_telethon_client()
             await run_worker_loop(ptb_app=None)
 
@@ -2027,7 +2087,7 @@ def main():
     if SERVICE_MODE == "all":
         logger.info("[SERVICE_MODE] Running in ALL mode (Bot Polling + MTProto Worker Engine).")
         async def post_init(application: Application):
-            await run_worker_diagnostics()
+            await safe_run_diagnostics()
             asyncio.create_task(run_worker_loop(application))
 
         app.post_init = post_init
@@ -2036,11 +2096,11 @@ def main():
     try:
         app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     except telegram.error.InvalidToken as exc:
-        logger.error(f"Invalid Telegram bot token: {exc}. Web HTTP server remains active on port {PORT}.")
+        logger.exception("Telegram polling startup failed due to InvalidToken. Web HTTP server remains active on port 3000.")
         while True:
             time.sleep(3600)
     except Exception as exc:
-        logger.error(f"Telegram polling error: {exc}. Web HTTP server remains active on port {PORT}.")
+        logger.exception("Telegram polling startup failed. Web HTTP server remains active on port 3000.")
         while True:
             time.sleep(3600)
 

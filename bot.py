@@ -10,13 +10,15 @@ import sys
 import re
 import json
 import time
+import signal
+import traceback
 import logging
 import asyncio
 import sqlite3
 import shutil
 import uuid
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Set, Tuple
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
@@ -312,7 +314,46 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     conn.close()
     return dict(row) if row else None
 
+def claim_next_queued_job() -> Optional[Dict[str, Any]]:
+    """Atomically fetch and claim the next QUEUED job by updating its status to DOWNLOADING."""
+    conn = get_sqlite_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT * FROM jobs WHERE status = 'QUEUED' ORDER BY created_at ASC LIMIT 1")
+        row = cursor.fetchone()
+        if not row:
+            conn.commit()
+            conn.close()
+            return None
+        job_data = dict(row)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cursor.execute(
+            "UPDATE jobs SET status = 'DOWNLOADING', progress_stage = 'DOWNLOADING', progress_percent = 0, updated_at = ? WHERE job_id = ? AND status = 'QUEUED'",
+            (now_iso, job_data["job_id"])
+        )
+        if cursor.rowcount == 0:
+            conn.commit()
+            conn.close()
+            return None
+        conn.commit()
+        conn.close()
+        job_data["status"] = "DOWNLOADING"
+        job_data["progress_stage"] = "DOWNLOADING"
+        job_data["progress_percent"] = 0
+        job_data["updated_at"] = now_iso
+        return job_data
+    except Exception as e:
+        logger.error(f"Error claiming next queued job: {e}")
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return None
+
 def get_next_queued_job() -> Optional[Dict[str, Any]]:
+    """Retrieve the next QUEUED job without mutating its state."""
     conn = get_sqlite_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM jobs WHERE status = 'QUEUED' ORDER BY created_at ASC LIMIT 1")
@@ -1070,29 +1111,145 @@ async def run_worker_diagnostics():
     except Exception as exc:
         logger.warning(f"[DIAGNOSTICS] Diagnostics warning: {exc}")
 
-async def run_worker_loop(ptb_app: Optional[Application] = None):
+async def run_worker_loop_core(bot_instance: Optional[Any] = None, shutdown_event: Optional[asyncio.Event] = None):
+    """Core long-running worker processing loop."""
     global worker_running
     worker_running = True
-    logger.info("MTProto Worker Loop started...")
+    logger.info("[WORKER] Worker loop running")
+    logger.info("[WORKER] Waiting for jobs...")
 
-    while worker_running:
+    last_waiting_log = 0.0
+    consecutive_errors = 0
+
+    while worker_running and (shutdown_event is None or not shutdown_event.is_set()):
         try:
-            job = get_next_queued_job()
+            job = claim_next_queued_job()
             if not job:
-                await asyncio.sleep(2.0)
+                now = time.time()
+                if now - last_waiting_log > 300.0:
+                    last_waiting_log = now
+                    logger.info("[WORKER] Waiting for jobs... (worker active and queue healthy)")
+
+                try:
+                    await asyncio.sleep(2.0)
+                except asyncio.CancelledError:
+                    break
+                consecutive_errors = 0
                 continue
 
+            consecutive_errors = 0
             async with worker_lock:
-                await process_single_job(job, ptb_app)
+                await process_single_job(job, ptb_app=None, direct_bot=bot_instance)
 
         except asyncio.CancelledError:
-            logger.info("Worker loop cancelled.")
+            logger.info("[WORKER] Worker loop cancelled.")
             break
         except Exception as e:
-            logger.error(f"Error in MTProto worker loop: {e}", exc_info=e)
-            await asyncio.sleep(3.0)
+            consecutive_errors += 1
+            logger.error(f"[WORKER] Unhandled exception in worker loop: {e}\n{traceback.format_exc()}")
+            backoff_sec = min(30.0, 2.0 * consecutive_errors)
+            logger.info(f"[WORKER] Backing off worker loop for {backoff_sec:.1f}s before retrying...")
+            try:
+                await asyncio.sleep(backoff_sec)
+            except asyncio.CancelledError:
+                break
 
-async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]):
+    logger.info("[WORKER] Worker loop stopped.")
+
+async def run_worker_lifecycle():
+    """Manages the full lifecycle of the worker node including graceful signal shutdown."""
+    logger.info("[WORKER] Starting worker lifecycle...")
+
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def handle_signal(sig_name: str):
+        logger.info(f"[WORKER] Shutdown signal received ({sig_name})")
+        shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, lambda s=sig.name: handle_signal(s))
+        except (NotImplementedError, AttributeError):
+            signal.signal(sig, lambda s, f, s_name=sig.name: handle_signal(s_name))
+
+    try:
+        await run_worker_diagnostics()
+    except Exception as err:
+        logger.warning(f"[DIAGNOSTICS] Diagnostic check warning: {err}")
+
+    if shutdown_event.is_set():
+        logger.info("[WORKER] Shutdown requested during startup.")
+        return
+
+    client = await get_telethon_client()
+    if client:
+        logger.info("[WORKER] Persistent Telethon connected")
+    else:
+        logger.warning("[WORKER] Persistent Telethon client not available. Worker running in fallback mode.")
+
+    if shutdown_event.is_set():
+        logger.info("[WORKER] Shutdown requested after telethon init.")
+        if telethon_client:
+            try:
+                if telethon_client.is_connected():
+                    await telethon_client.disconnect()
+            except Exception:
+                pass
+        return
+
+    bot_instance = None
+    if BOT_TOKEN:
+        try:
+            import telegram
+            bot_instance = telegram.Bot(token=BOT_TOKEN)
+            await bot_instance.initialize()
+        except Exception as e:
+            logger.warning(f"[WORKER] Standalone bot instance initialization note: {e}")
+
+    worker_task = asyncio.create_task(run_worker_loop_core(bot_instance=bot_instance, shutdown_event=shutdown_event))
+
+    # Keep worker process alive awaiting shutdown signal or task termination
+    try:
+        await shutdown_event.wait()
+    except asyncio.CancelledError:
+        logger.info("[WORKER] Lifecycle received cancellation.")
+
+    # Graceful shutdown sequence
+    logger.info("[WORKER] Stopping worker...")
+    global worker_running
+    worker_running = False
+
+    if not worker_task.done():
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[WORKER] Error awaiting worker task during shutdown: {e}")
+
+    if telethon_client:
+        try:
+            if telethon_client.is_connected():
+                await telethon_client.disconnect()
+            logger.info("[WORKER] Telethon disconnected")
+        except Exception as e:
+            logger.warning(f"[WORKER] Error disconnecting Telethon: {e}")
+
+    if bot_instance:
+        try:
+            await bot_instance.shutdown()
+        except Exception:
+            pass
+
+    logger.info("[WORKER] Worker shutdown complete")
+
+async def run_worker_loop(ptb_app: Optional[Application] = None):
+    bot_client = ptb_app.bot if ptb_app else None
+    await run_worker_loop_core(bot_instance=bot_client)
+
+async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application] = None, direct_bot: Optional[Any] = None):
     t_job_claimed = time.time()
     job_id = job["job_id"]
     chat_id = job["chat_id"]
@@ -1114,7 +1271,7 @@ async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]
     logger.info(f"Worker picking up job {job_id} for file '{original_filename}' ({format_size(file_size)}) [PERF Queue Wait: {queue_wait_sec}s]")
     update_job(job_id, {"status": "DOWNLOADING", "progress_stage": "DOWNLOADING", "progress_percent": 0})
 
-    bot_client = ptb_app.bot if ptb_app else None
+    bot_client = direct_bot if direct_bot else (ptb_app.bot if ptb_app else None)
 
     async def notify_ui(text: str, reply_markup=None):
         nonlocal status_msg_id
@@ -1650,22 +1807,34 @@ def sanitize_filename(name: str) -> str:
 # 8. HTTP HEALTH CHECK SERVER (PORT 3000)
 # ============================================================
 
+_http_server_instance: Optional[HTTPServer] = None
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        body = b'{"status": "ok", "service": "b2-telegram-storage-bot", "mode": "' + SERVICE_MODE.encode() + b'"}\n'
         self.send_response(200)
-        self.send_header("Content-type", "application/json")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b'{"status": "ok", "service": "b2-telegram-storage-bot"}')
+        self.wfile.write(body)
+
+    def do_HEAD(self):
+        body = b'{"status": "ok", "service": "b2-telegram-storage-bot", "mode": "' + SERVICE_MODE.encode() + b'"}\n'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
 
     def log_message(self, format, *args):
         pass
 
 def start_health_server():
+    global _http_server_instance
     try:
-        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        _http_server_instance = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+        thread = threading.Thread(target=_http_server_instance.serve_forever, daemon=True)
         thread.start()
-        logger.info(f"Health check HTTP server listening on port {PORT}")
+        logger.info(f"Health check HTTP server listening on port {PORT} (mode={SERVICE_MODE})")
     except Exception as e:
         logger.warning(f"Could not bind HTTP server on port {PORT}: {e}")
 
@@ -2288,8 +2457,20 @@ def main():
     b2_ok, b2_msg = b2_storage.check_health()
     logger.info(f"B2 Startup Check: {b2_msg}")
 
+    # Mode-based Execution
+    if SERVICE_MODE == "worker":
+        logger.info("[SERVICE_MODE] Running in WORKER mode. Telegram Bot API polling is DISABLED.")
+        try:
+            asyncio.run(run_worker_lifecycle())
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("[WORKER] Worker process terminated gracefully.")
+        except Exception as e:
+            logger.error(f"[WORKER] Fatal error in worker lifecycle: {e}\n{traceback.format_exc()}")
+            sys.exit(1)
+        return
+
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN environment variable is missing.")
+        logger.error("BOT_TOKEN environment variable is missing for bot polling mode.")
         sys.exit(1)
 
     app = (
@@ -2322,44 +2503,39 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_incoming_message))
 
-    # Mode Startup Logging
-    if SERVICE_MODE == "bot":
-        logger.info("[STARTUP] SERVICE_MODE=bot")
-        logger.info("[STARTUP] Bot API polling owner: YES")
-        logger.info("[STARTUP] MTProto worker: NO")
-    elif SERVICE_MODE == "worker":
-        logger.info("[STARTUP] SERVICE_MODE=worker")
-        logger.info("[STARTUP] Bot API polling owner: NO")
-        logger.info("[STARTUP] MTProto worker: YES")
-    elif SERVICE_MODE == "all":
-        logger.info("[STARTUP] SERVICE_MODE=all")
-        logger.info("[STARTUP] Bot API polling owner: YES")
-        logger.info("[STARTUP] MTProto worker: YES")
-
-    async def safe_run_diagnostics():
-        try:
-            await run_worker_diagnostics()
-        except Exception as err:
-            logger.warning(f"[DIAGNOSTICS] Diagnostic check failed gracefully: {err}")
-
-    # Mode-based Execution
-    if SERVICE_MODE == "worker":
-        logger.info("[SERVICE_MODE] Running in WORKER mode. Telegram Bot API polling is DISABLED.")
-        async def main_worker():
-            await safe_run_diagnostics()
-            await get_telethon_client()
-            await run_worker_loop(ptb_app=None)
-
-        asyncio.run(main_worker())
-        return
-
     if SERVICE_MODE == "all":
         logger.info("[SERVICE_MODE] Running in ALL mode (Bot Polling + MTProto Worker Engine).")
+        worker_task_all: Optional[asyncio.Task] = None
+
         async def post_init(application: Application):
+            nonlocal worker_task_all
             await safe_run_diagnostics()
-            asyncio.create_task(run_worker_loop(application))
+            await get_telethon_client()
+            worker_task_all = asyncio.create_task(run_worker_loop_core(bot_instance=application.bot))
+
+        async def post_shutdown(application: Application):
+            nonlocal worker_task_all
+            logger.info("[WORKER] Stopping worker task on application shutdown...")
+            global worker_running
+            worker_running = False
+            if worker_task_all and not worker_task_all.done():
+                worker_task_all.cancel()
+                try:
+                    await worker_task_all
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"Error awaiting worker task: {e}")
+            if telethon_client:
+                try:
+                    if telethon_client.is_connected():
+                        await telethon_client.disconnect()
+                    logger.info("[WORKER] Telethon disconnected")
+                except Exception as e:
+                    logger.warning(f"Error disconnecting telethon: {e}")
 
         app.post_init = post_init
+        app.post_shutdown = post_shutdown
 
     logger.info("[SERVICE_MODE] Initiating Telegram Bot API polling...")
     try:

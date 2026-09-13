@@ -547,6 +547,18 @@ class B2StorageEngine:
 
 b2_storage = B2StorageEngine()
 
+def check_disk_space(required_bytes: int = 500 * 1024 * 1024) -> Tuple[bool, str]:
+    """Check available disk space at TEMP_DIR location against required bytes using real OS disk statistics."""
+    try:
+        stat = shutil.disk_usage(TEMP_DIR)
+        free_bytes = stat.free
+        if free_bytes < required_bytes:
+            return False, f"Free disk space ({format_size(free_bytes)}) is less than required ({format_size(required_bytes)})."
+        return True, f"Disk space OK: {format_size(free_bytes)} free."
+    except Exception as e:
+        logger.warning(f"Disk space check exception: {e}")
+        return True, f"Disk space check bypassed: {e}"
+
 # ============================================================
 # 4. FFMPEG & MEDIA INSPECTION ENGINE
 # ============================================================
@@ -1371,7 +1383,7 @@ def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r'[/*?:"<>|]', '_', cleaned)
     return cleaned.strip()
 
-def check_disk_space(required_bytes: int) -> Tuple[bool, str]:
+def check_disk_space(required_bytes: int = 500 * 1024 * 1024) -> Tuple[bool, str]:
     try:
         total, used, free = shutil.disk_usage(TEMP_DIR)
         if free < required_bytes:
@@ -1380,7 +1392,7 @@ def check_disk_space(required_bytes: int) -> Tuple[bool, str]:
                 f"• Required: {required_bytes} bytes ({format_size(required_bytes)})\n"
                 f"• Available: {free} bytes ({format_size(free)})"
             )
-        return True, "Disk space OK"
+        return True, f"Disk space OK: {format_size(free)} free."
     except Exception as e:
         return True, str(e)
 
@@ -1985,13 +1997,20 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
 # 12. GLOBAL ERROR HANDLER
 # ============================================================
 
+_last_conflict_log_time = 0.0
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _last_conflict_log_time
     err = context.error
     if isinstance(err, telegram.error.Conflict):
-        logger.warning(
-            "Telegram getUpdates Conflict: Another bot instance is currently active with this BOT_TOKEN. "
-            "If deploying on Render / cloud, the previous container instance will terminate shortly and polling will resume automatically."
-        )
+        now = time.time()
+        if now - _last_conflict_log_time > 60.0:
+            _last_conflict_log_time = now
+            logger.warning(
+                "[409 CONFLICT] Telegram getUpdates Conflict: Another process or service instance is actively polling Telegram Bot API with this BOT_TOKEN. "
+                "Backing off getUpdates retry loop. Set SERVICE_MODE=worker on worker nodes to disable Bot API polling."
+            )
+        await asyncio.sleep(15)
     elif isinstance(err, telegram.error.NetworkError):
         logger.warning(f"Telegram Network Error encountered: {err}. Retrying automatically...")
     elif isinstance(err, telegram.error.TimedOut):
@@ -2056,16 +2075,16 @@ def main():
     # Mode Startup Logging
     if SERVICE_MODE == "bot":
         logger.info("[STARTUP] SERVICE_MODE=bot")
-        logger.info("[STARTUP] Telegram polling enabled")
-        logger.info("[STARTUP] MTProto worker disabled")
+        logger.info("[STARTUP] Bot API polling owner: YES")
+        logger.info("[STARTUP] MTProto worker: NO")
     elif SERVICE_MODE == "worker":
         logger.info("[STARTUP] SERVICE_MODE=worker")
-        logger.info("[STARTUP] Telegram polling disabled")
-        logger.info("[STARTUP] MTProto worker enabled")
+        logger.info("[STARTUP] Bot API polling owner: NO")
+        logger.info("[STARTUP] MTProto worker: YES")
     elif SERVICE_MODE == "all":
         logger.info("[STARTUP] SERVICE_MODE=all")
-        logger.info("[STARTUP] Bot polling enabled")
-        logger.info("[STARTUP] MTProto worker enabled (single process ownership)")
+        logger.info("[STARTUP] Bot API polling owner: YES")
+        logger.info("[STARTUP] MTProto worker: YES")
 
     async def safe_run_diagnostics():
         try:

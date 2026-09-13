@@ -696,28 +696,30 @@ async def get_telethon_client() -> Optional[Any]:
         return telethon_client
 
     if not API_ID or not API_HASH:
-        logger.warning("MTProto API_ID or API_HASH is missing. Telethon MTProto client cannot start.")
+        logger.warning("[MTPROTO] API_ID or API_HASH missing. Telethon MTProto client cannot start.")
         return None
 
     try:
         if TELEGRAM_SESSION_STRING:
-            logger.info("Initializing Telethon client with TELEGRAM_SESSION_STRING...")
+            logger.info("[MTPROTO] Initializing persistent Telethon client with TELEGRAM_SESSION_STRING...")
             session = StringSession(TELEGRAM_SESSION_STRING)
             telethon_client = TelegramClient(session, API_ID, API_HASH)
             await telethon_client.connect()
             if not await telethon_client.is_user_authorized():
-                logger.error("TELEGRAM_SESSION_STRING is invalid or not authorized.")
+                logger.error("[MTPROTO] TELEGRAM_SESSION_STRING is invalid or not authorized.")
+                telethon_client = None
                 return None
         else:
-            logger.info("Initializing Telethon client with Bot Token...")
+            logger.info("[MTPROTO] Initializing persistent Telethon client with Bot Token...")
             session = StringSession()
             telethon_client = TelegramClient(session, API_ID, API_HASH)
             await telethon_client.start(bot_token=BOT_TOKEN)
 
-        logger.info("Telethon MTProto client initialized & connected successfully!")
+        logger.info("[MTPROTO] Persistent Telethon MTProto client connected & authorized successfully!")
         return telethon_client
     except Exception as e:
-        logger.error(f"Failed to initialize Telethon MTProto client: {e}")
+        logger.error(f"[MTPROTO] Failed to initialize persistent Telethon client: {e}")
+        telethon_client = None
         return None
 
 async def download_telegram_file_mtproto(
@@ -730,29 +732,70 @@ async def download_telegram_file_mtproto(
     if not client:
         raise RuntimeError("MTProto client is not configured or unavailable. Set API_ID and API_HASH.")
 
+    logger.info(f"[WORKER] Download starting for chat_id={chat_id}, message_id={message_id}")
     msg = await client.get_messages(chat_id, ids=message_id)
     if not msg or not msg.media:
         raise RuntimeError(f"Telegram message {message_id} in chat {chat_id} not found or contains no media via MTProto.")
 
-    last_progress_time = [0.0]
+    dc_id = getattr(msg.media.document, "dc_id", None) if hasattr(msg.media, "document") else getattr(msg.media, "dc_id", "Unknown")
+    expected_size = getattr(msg.media.document, "size", 0) if hasattr(msg.media, "document") else getattr(msg.media, "size", 0)
+
+    logger.info(f"[WORKER] Telegram DC resolved: DC {dc_id}")
+    logger.info(f"[WORKER] Download destination: {output_path.resolve()}")
+    logger.info(f"[WORKER] Expected size: {expected_size} bytes ({format_size(expected_size)})")
+
+    start_time = time.time()
+    last_update_time = [0.0]
+    main_loop = asyncio.get_running_loop()
 
     def raw_progress_cb(current: int, total: int):
         now = time.time()
-        if now - last_progress_time[0] >= 3.0 or current == total:
-            last_progress_time[0] = now
+        if now - last_update_time[0] >= 1.5 or current == total:
+            last_update_time[0] = now
+            elapsed = now - start_time
+            speed = current / elapsed if elapsed > 0 else 0
+            remaining = total - current
+            eta_sec = remaining / speed if speed > 0 else 0
             if progress_callback:
                 asyncio.run_coroutine_threadsafe(
-                    progress_callback(current, total),
-                    loop=asyncio.get_event_loop()
+                    progress_callback(current, total, speed, eta_sec),
+                    loop=main_loop
                 )
 
-    await client.download_media(
-        msg,
-        file=str(output_path),
-        progress_callback=raw_progress_cb if progress_callback else None
-    )
+    max_attempts = 3
+    attempt = 0
+    success = False
 
-    return output_path.exists() and output_path.stat().st_size > 0
+    while attempt < max_attempts and not success:
+        attempt += 1
+        try:
+            logger.info(f"[WORKER] Download attempt {attempt}/{max_attempts} starting...")
+            await client.download_media(
+                msg,
+                file=str(output_path),
+                progress_callback=raw_progress_cb if progress_callback else None
+            )
+
+            if output_path.exists() and output_path.stat().st_size > 0:
+                actual_size = output_path.stat().st_size
+                logger.info("[WORKER] Download completed")
+                logger.info(f"[WORKER] Expected size: {expected_size} bytes")
+                logger.info(f"[WORKER] Downloaded size: {actual_size} bytes")
+
+                if expected_size > 0 and actual_size != expected_size:
+                    logger.error("[WORKER] Verification: FAIL (Size mismatch)")
+                    raise RuntimeError(f"Downloaded file size mismatch: Expected {expected_size} bytes, got {actual_size} bytes")
+
+                logger.info("[WORKER] Verification: PASS")
+                success = True
+                break
+        except Exception as e:
+            logger.warning(f"[WORKER] Download attempt {attempt} failed: {e}")
+            if attempt < max_attempts:
+                await asyncio.sleep(2.0)
+                client = await get_telethon_client()
+
+    return success
 
 async def setup_telethon_session_cli():
     """Interactive setup for generating TELEGRAM_SESSION_STRING."""
@@ -884,13 +927,30 @@ async def process_single_job(job: Dict[str, Any], ptb_app: Optional[Application]
     try:
         # 2. MTProto Download
         if API_ID and API_HASH and TELETHON_AVAILABLE:
-            async def download_cb(current: int, total: int):
+            def format_time(seconds: float) -> str:
+                if seconds <= 0:
+                    return "00:00"
+                m, s = divmod(int(seconds), 60)
+                h, m = divmod(m, 60)
+                if h > 0:
+                    return f"{h:02d}:{m:02d}:{s:02d}"
+                return f"{m:02d}:{s:02d}"
+
+            async def download_cb(current: int, total: int, speed: float = 0.0, eta_sec: float = 0.0):
                 pct = int((current / total) * 100) if total else 0
-                update_job(job_id, {"progress_percent": pct})
+                filled = int(round(10 * pct / 100))
+                bar = "█" * filled + "░" * (10 - filled)
+                speed_text = f"{format_size(int(speed))}/s" if speed > 0 else "0 B/s"
+                eta_text = format_time(eta_sec)
+
+                update_job(job_id, {"progress_percent": pct, "progress_stage": "DOWNLOADING"})
                 await notify_ui(
-                    "⬇️ *Downloading Telegram file via MTProto...*\n\n"
+                    "⬇️ *Downloading from Telegram via MTProto*\n\n"
                     f"📄 *File:* `{original_filename}`\n"
-                    f"📊 *Progress:* `{pct}%` (`{format_size(current)}` / `{format_size(total)}`)"
+                    f"📁 *Folder:* `{folder}`\n\n"
+                    f"`[{bar}] {pct}%`\n\n"
+                    f"📊 `{format_size(current)} / {format_size(total)}`\n"
+                    f"🚀 *Speed:* `{speed_text}` | ⏱ *ETA:* `{eta_text}`"
                 )
 
             download_ok = await download_telegram_file_mtproto(
@@ -1953,15 +2013,26 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_incoming_message))
 
-    # Mode-based Execution
-    if SERVICE_MODE in ["worker", "all"]:
-        # Launch worker loop as background task inside PTB event loop or standalone loop
+    # Clean Mode-based Execution
+    if SERVICE_MODE == "worker":
+        logger.info("[SERVICE_MODE] Running in WORKER mode. Telegram Bot API polling is DISABLED.")
+        async def main_worker():
+            await run_worker_diagnostics()
+            await get_telethon_client()
+            await run_worker_loop(ptb_app=None)
+
+        asyncio.run(main_worker())
+        return
+
+    if SERVICE_MODE == "all":
+        logger.info("[SERVICE_MODE] Running in ALL mode (Bot Polling + MTProto Worker Engine).")
         async def post_init(application: Application):
+            await run_worker_diagnostics()
             asyncio.create_task(run_worker_loop(application))
 
         app.post_init = post_init
 
-    logger.info("Bot polling initiated...")
+    logger.info("[SERVICE_MODE] Initiating Telegram Bot API polling...")
     try:
         app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     except telegram.error.InvalidToken as exc:

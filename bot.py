@@ -60,7 +60,7 @@ if API_ID_RAW and API_ID_RAW.isdigit():
 
 SERVICE_MODE = (os.getenv("SERVICE_MODE") or "all").strip().lower()  # 'render', 'worker', or 'all'
 
-ADMIN_IDS_RAW = (os.getenv("ADMIN_IDS") or "5192451273").strip()
+ADMIN_IDS_RAW = (os.getenv("ADMIN_IDS") or "5192451273, 8525952693").strip()
 ADMIN_IDS: Set[int] = set()
 if ADMIN_IDS_RAW:
     for item in ADMIN_IDS_RAW.split(","):
